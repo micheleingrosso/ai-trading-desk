@@ -1,16 +1,16 @@
 {
-  "name": "ai-trading-desk-v1",
-  "version": "1.0.1",
+  "name": "ai-trading-desk-v1-1",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Scout + market data + Cloudflare D1 dashboard. Paper-only informational prototype.",
+  "description": "Scout advanced 5Min + news + Telegram alerts. Observation-only Cloudflare D1.",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:local": "wrangler d1 migrations apply trading-desk-db --local",
     "db:remote": "wrangler d1 migrations apply trading-desk-db --remote",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/index.js && node --check src/scout.js && node --check src/auth.js && node --check src/ui.js"
+    "check": "node --check src/index.js && node --check src/scout.js && node --check src/auth.js && node --check src/ui.js && node --check src/technical.js && node --check src/news.js && node --check src/alerts.js && node --check worker-single-file.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

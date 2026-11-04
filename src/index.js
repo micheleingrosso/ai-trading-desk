@@ -1,8 +1,11 @@
 import { calculateMetrics, partsNY, SCOUT_RULES } from './scout.js';
 import { validPassword, makeSession, validSession, sessionCookie, expiredSessionCookie, isSameOrigin } from './auth.js';
 import { dashboardHtml, loginHtml, appCss, appJs } from './ui.js';
+import { calculateTechnical, TECH_CONFIG } from './technical.js';
+import { normalizeNews, buildNewsUrl } from './news.js';
+import { sendTelegram } from './alerts.js';
 
-// Only read-only market data endpoints are used. NO broker order APIs anywhere in V1.
+// Only read-only market data endpoints are used. NO broker order API endpoints in V1.1.
 const DATA_BASE = 'https://data.alpaca.markets/v2';
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -52,6 +55,69 @@ async function alpacaBars(env, symbol) {
   return data.bars;
 }
 
+async function alpaca5mBars(env, symbol) {
+  // Seven calendar days of 5Min bars: normally under the 1,000-row per-symbol limit.
+  // Fail closed on partial pagination, instead of calculating indicators from missing candles.
+  const url = new URL(`${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars`);
+  url.searchParams.set('timeframe', '5Min');
+  url.searchParams.set('feed', 'iex');
+  url.searchParams.set('adjustment', 'raw');
+  url.searchParams.set('sort', 'asc');
+  url.searchParams.set('limit', '1000');
+  url.searchParams.set('start', new Date(Date.now() - 7 * 86_400_000).toISOString());
+  url.searchParams.set('end', new Date().toISOString());
+  const data = await alpacaFetch(env, url.toString());
+  if (data.next_page_token) throw new Error(`${symbol}: pagina 5Min incompleta`);
+  if (!Array.isArray(data.bars)) throw new Error(`${symbol}: risposta 5Min non valida`);
+  return data.bars;
+}
+async function saveTechnical(env, symbol, metric) {
+  if(!metric?.ok) return;
+  await env.DB.prepare(`INSERT INTO technical_snapshots
+    (symbol,bar_ts,close,volume,rsi14,ema20,sma50,high20,volume_ratio20,trend,breakout,bull_flag_candidate,feed,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'iex', ?)
+    ON CONFLICT(symbol) DO UPDATE SET
+      bar_ts=excluded.bar_ts,close=excluded.close,volume=excluded.volume,
+      rsi14=excluded.rsi14,ema20=excluded.ema20,sma50=excluded.sma50,
+      high20=excluded.high20,volume_ratio20=excluded.volume_ratio20,
+      trend=excluded.trend,breakout=excluded.breakout,
+      bull_flag_candidate=excluded.bull_flag_candidate,updated_at=excluded.updated_at
+    WHERE excluded.bar_ts >= technical_snapshots.bar_ts`)
+    .bind(symbol,metric.barTs,metric.close,metric.volume,metric.rsi14,metric.ema20,
+      metric.sma50,metric.high20,metric.volumeRatio20,metric.trend,
+      Number(metric.breakout),Number(metric.bullFlagCandidate),iso()).run();
+}
+async function saveTechnicalEvents(env, symbol, metric, today, used) {
+  if(!metric?.ok || !metric.events.length) return [];
+  const emitted=[];
+  for(const event of metric.events){
+    if(used+emitted.length >= TECH_CONFIG.maxEventsPerDay)break;
+    const prev=await env.DB.prepare(`SELECT bar_ts FROM technical_events
+      WHERE symbol=? AND kind=? ORDER BY bar_ts DESC LIMIT 1`).bind(symbol,event.kind).first();
+    if(prev && Date.parse(metric.barTs)-Date.parse(prev.bar_ts)<TECH_CONFIG.eventCooldownMinutes*60_000)continue;
+    const res=await env.DB.prepare(`INSERT OR IGNORE INTO technical_events
+      (id,symbol,bar_ts,trade_date,kind,description,price,rsi14,volume_ratio20,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),symbol,metric.barTs,today,
+        event.kind,event.description,metric.close,metric.rsi14,metric.volumeRatio20,iso()).run();
+    if(res.meta?.changes)emitted.push({symbol,kind:event.kind,close:metric.close});
+  }
+  return emitted;
+}
+async function fetchNews(env, symbols) {
+  const response=await alpacaFetch(env,buildNewsUrl(symbols));
+  if(!Array.isArray(response.news))throw new Error('Risposta News Alpaca non valida');
+  const articles=normalizeNews(response.news,symbols);
+  if(articles.length){
+    // Individual writes: safe for D1 free-tier limits and idempotent on repeated scans.
+    for(const a of articles){
+      await env.DB.prepare(`INSERT OR IGNORE INTO news_items
+       (article_id,headline,source,source_url,published_at,symbols_json,fetched_at)
+       VALUES(?,?,?,?,?,?,?)`).bind(a.id,a.headline,a.source,a.url,a.publishedAt,JSON.stringify(a.symbols),iso()).run();
+    }
+  }
+  return articles.length;
+}
+
 async function tryLock(env) {
   const owner = crypto.randomUUID();
   const now = Date.now();
@@ -80,7 +146,7 @@ export async function runScan(env, source = 'manual') {
   const owner = await tryLock(env);
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
-  let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false;
+  let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0;
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
@@ -98,16 +164,18 @@ export async function runScan(env, source = 'manual') {
       return { status, detail, symbols_checked: 0, alerts_created: 0 };
     }
     const cache = new Map();
-    // At most five concurrent outbound HTTP calls.
+    // At most four concurrent ticker jobs; two read-only data fetches per symbol.
     const outcomes = [];
-    for (let i = 0; i < symbols.length; i += 5) {
-      const chunk = symbols.slice(i, i + 5);
+    for (let i = 0; i < symbols.length; i += 4) {
+      const chunk = symbols.slice(i, i + 4);
       const result = await Promise.all(chunk.map(async symbol => {
         try {
-          const bars = await alpacaBars(env, symbol);
-          const metric = calculateMetrics(bars, new Date(), cache);
-          await saveRecentBars(env, symbol, bars);
-          return { symbol, metric };
+          const [bars15,bars5]=await Promise.all([alpacaBars(env,symbol),alpaca5mBars(env,symbol)]);
+          const metric = calculateMetrics(bars15, new Date(), cache);
+          const technical = calculateTechnical(bars5, new Date(), cache);
+          await saveRecentBars(env,symbol,bars15);
+          await saveTechnical(env,symbol,technical);
+          return { symbol, metric, technical };
         } catch (e) { return { symbol, error: String(e.message || e).slice(0, 180) }; }
       }));
       outcomes.push(...result);
@@ -133,9 +201,28 @@ export async function runScan(env, source = 'manual') {
         ).run();
       if (result.meta?.changes) { used++; alerts++; }
     }
+    const existingTech = await env.DB.prepare('SELECT COUNT(*) AS n FROM technical_events WHERE trade_date=?')
+      .bind(today).first();
+    let techUsed=Number(existingTech?.n||0);
+    const newEvents=[];
+    for(const {symbol,technical,error} of outcomes){
+      if(error || !technical?.ok || techUsed>=TECH_CONFIG.maxEventsPerDay)continue;
+      const events=await saveTechnicalEvents(env,symbol,technical,today,techUsed);
+      newEvents.push(...events);techUsed+=events.length;
+    }
+    techEvents=newEvents.length;
+    const readyTechnical=outcomes.filter(o=>o.technical?.ok).length;
+    let newsError='';
+    try{newsCount=await fetchNews(env,symbols);}catch(e){
+      // News source is optional in V1.1; market data can still work.
+      newsError=`News non disponibili: ${String(e?.message||e).slice(0,100)}`;
+    }
+    const telegram=await sendTelegram(env,newEvents);
+    const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie` +
+      (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'');
     status = errors.length ? (checked ? 'partial' : 'error') : 'success';
-    detail = errors.length ? errors.slice(0, 5).join(' | ') :
-      `Controllati ${checked}/${symbols.length} titoli · feed IEX · ${alerts} anomalie nuove`;
+    detail = (errors.length ? errors.slice(0, 5).join(' | ') :
+      `Controllati ${checked}/${symbols.length} titoli · feed IEX · ${alerts} anomalie Scout`) + suffix;
     return { status, detail, symbols_checked: checked, alerts_created: alerts };
   } catch (e) {
     status = 'error'; detail = String(e.message || e).slice(0, 500);
@@ -151,7 +238,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -159,14 +246,20 @@ async function overview(env) {
     env.DB.prepare(`SELECT symbol,bar_ts,trade_date,price,pct_1h,volume_ratio,volume,baseline_volume,reason,created_at,feed
        FROM signals ORDER BY created_at DESC LIMIT 30`).all(),
     env.DB.prepare(`SELECT id,started_at,finished_at,status,source,symbols_checked,alerts_created,detail FROM scan_runs ORDER BY started_at DESC LIMIT 8`).all(),
-    env.DB.prepare(`SELECT COUNT(*) AS count FROM signals`).first()
+    env.DB.prepare(`SELECT COUNT(*) AS count FROM signals`).first(),
+    env.DB.prepare(`SELECT symbol,bar_ts,close,rsi14,ema20,sma50,high20,volume_ratio20,trend,breakout,bull_flag_candidate,updated_at FROM technical_snapshots ORDER BY symbol`).all(),
+    env.DB.prepare(`SELECT symbol,bar_ts,kind,description,price,rsi14,volume_ratio20,created_at FROM technical_events ORDER BY created_at DESC LIMIT 30`).all(),
+    env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all()
   ]);
   return {
     mode: 'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
     time: iso(), rules: SCOUT_RULES,
     watchlist: watch.results || [], signals: signals.results || [], scans: scans.results || [],
+    technical: technical.results || [], technicalEvents: technicalEvents.results || [],
+    news: (news.results||[]).map(n=>({...n,symbols:JSON.parse(n.symbols_json||'[]'),symbols_json:undefined})),
+    alertsConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     totalSignals: totals?.count || 0,
-    positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.
+    positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.1.
     virtualBalance: 10000, // Display-only illustrative value; not a simulated portfolio ledger.
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };

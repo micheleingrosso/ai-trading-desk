@@ -1,179 +1,37 @@
-# AI Trading Desk — Scout 1.0.1 (correzione login)
+# AI Trading Desk 1.1 — Scout Advanced + News + Alerts
 
-**Prototipo operativo di monitoraggio informativo, per uso personale.** La V1.0 non è un broker, non genera ordini e non fa paper trading effettivo: serve a raccogliere dati, rilevare anomalie, tenerne uno storico e verificare che la base tecnica funzioni.
+**Aggiornamento per una installazione V1.0.1 già funzionante.** Non bisogna creare un nuovo Worker o un nuovo database. La guida operativa da seguire è **[AGGIORNAMENTO_1.1.md](AGGIORNAMENTO_1.1.md)**.
 
-> **Aggiornamento 1.0.1:** corretto errore `Origine richiesta non valida` dopo il login in browser con `Origin: null`, causato dalla combinazione tra form POST e `Referrer-Policy: no-referrer`. È mantenuto il controllo delle richieste cross-origin. Per aggiornare un Worker già pubblicato usare `npx wrangler deploy` dalla cartella del progetto; non eliminare D1 e non modificare i segreti.
+## Cosa fa
 
-## Include
+- Mantiene le funzionalità 1.0.1: login HMAC, watchlist fino a 20 titoli, scansioni 15Min, anomalie Scout, storico D1, calendario Alpaca, cron 15 minuti, dashboard.
+- Aggiunge calcolo 5Min di RSI14 (Wilder), EMA20, SMA50, trend descrittivo, breakout del massimo delle 20 barre precedenti con filtro volume e possibile bull flag (euristica).
+- Archivia fino a 6 **nuovi eventi tecnici** per giorno di mercato, con cooldown 60 minuti per simbolo/tipo. Non genera eventi da barre non completate, dati non correnti o indicatori insufficienti.
+- Importa e deduplica articoli di notizie forniti da Alpaca, mostrando titolo, fonte, link originale, ticker e data. Non aggira paywall e non interpreta le notizie con un LLM.
+- Può notificare eventi tecnici con un solo messaggio tramite bot Telegram (se sono stati impostati i due segreti facoltativi).
+- Dashboard 1.1 con sezioni Scanner tecnico, Eventi tecnici e Notizie; dati di autenticazione, watchlist e log preesistenti conservati.
 
-- Worker Cloudflare con API privata e dashboard responsive.
-- Database Cloudflare D1, migrazione SQL e watchlist iniziale (10 titoli).
-- Scanner automatico **ogni 15 minuti nei feriali**; evita richieste di mercato quando l'API clock di Alpaca indica borsa chiusa (inclusi festivi/chiusure).
-- Alpaca Market Data API, feed `iex` gratuito. Interroga barre **15Min** degli ultimi 21 giorni per ciascun titolo, solo per la ricerca di anomalie.
-- Scout: segnala un movimento di almeno **±3% in un'ora** oppure un volume dell'ultima barra 15Min almeno **2× la mediana della stessa fascia oraria di fino a 5 giornate precedenti**.
-- Protezioni: almeno 3 giornate di riferimento per i volumi; soglie minime di volume per attenuare i falsi positivi; ignora barre non completate, dati vecchi e intervalli fuori orario regolare; massimo 5 nuovi segnali al giorno; cooldown 60 minuti per titolo; lock per evitare esecuzioni sovrapposte.
-- Storico scansioni, timestamp, fonte e reason di ogni evento. Watchlist modificabile (max 20 attivi).
-- Login privato con cookie HttpOnly, sessione firmata HMAC-SHA256 di 8 ore e controllo dell'origine per le azioni mutative.
-- Nessun accesso alle API di invio ordini Alpaca. **Il saldo di $10.000 è soltanto un riferimento grafico; non è un portafoglio simulato.**
+## Limiti
 
-## Prerequisiti
+Questa **non** è una strategia di trading validata. Non compie ordini, non ha un broker executor e non crea un portafoglio virtuale realmente movimentato. I $10.000 mostrati nella UI sono illustrativi. Non garantisce profitto o qualità di segnale. Il feed Alpaca IEX è parziale. Alcune notizie potrebbero non essere incluse nel piano Alpaca in uso.
 
-1. Account **Cloudflare**, senza bisogno di carta di credito se resti nei limiti gratuiti.
-2. Account **Alpaca Paper Only** (verifica la disponibilità per il tuo Paese) e coppia di credenziali API per il feed dati. Usa solo credenziali paper, mai credenziali reali.
-3. **Node.js 20.18 o successivo**, `npm`, terminale e accesso alla dashboard Cloudflare.
-4. Crea una password unica lunga **almeno 14 caratteri**, più una chiave casuale lunga **almeno 32 caratteri** per firmare le sessioni.
+## Installazione
 
-Le chiavi API non vanno incollate in chat né nel codice e **non vanno committate**. Il file `.dev.vars` è escluso da Git.
+Leggi `AGGIORNAMENTO_1.1.md` prima di intervenire sul Worker online. Per chi gestisce Cloudflare dal browser, sono inclusi:
 
-## Pubblicazione in Cloudflare — istruzioni passo per passo
+- `migrations/0002_technical_news.sql` — SQL non distruttivo da copiare nella Console D1.
+- `worker-single-file.js` — Worker completo da incollare in **Edit code → Deploy**.
+- `src/` — sorgenti modulari per Wrangler.
+- `test/` — test automatizzati eseguibili con `npm test`.
 
-Scarica ed estrai lo ZIP, apri un terminale nella cartella `ai-trading-desk-v1`.
+Per Wrangler è incluso `wrangler.jsonc` con `database_id` placeholder: sostituiscilo **con il tuo UUID D1 esistente**, oppure copia il file della vecchia installazione. In nessun caso sostituire valori reali con il placeholder.
 
-```bash
-npm install
-npx wrangler login
-npx wrangler d1 create trading-desk-db
-```
+## Moduli
 
-L'ultimo comando stampa un UUID. **Copia il valore esatto di `database_id`** e sostituisci nel file `wrangler.jsonc` il placeholder:
-
-```json
-"database_id": "00000000-0000-0000-0000-000000000000"
-```
-
-Poi applica il database **remoto**:
-
-```bash
-npx wrangler d1 migrations apply trading-desk-db --remote
-```
-
-Pubblica il Worker:
-
-```bash
-npx wrangler deploy
-```
-
-Imposta **quattro segreti** nel progetto: ciascun comando apre un prompt dove incollare il valore, che non viene scritto nel repository.
-
-```bash
-npx wrangler secret put ALPACA_KEY_ID
-npx wrangler secret put ALPACA_SECRET_KEY
-npx wrangler secret put DASHBOARD_PASSWORD
-npx wrangler secret put SESSION_SECRET
-```
-
-Per generare un secret casuale di firma da terminale (macOS/Linux):
-
-```bash
-openssl rand -hex 32
-```
-
-La firma deve essere **diversa dalla password di login**. Una volta creati i segreti, apri l'indirizzo `https://ai-trading-desk.<tuo-subdominio>.workers.dev` mostrato da Wrangler. Il link preciso è stampato dal deploy. Inserisci esclusivamente **la password della dashboard** nella pagina di login, non la chiave Alpaca.
-
-### Sviluppo locale
-
-Copia `.dev.vars.example` in `.dev.vars` e sostituisci i placeholder solo sul tuo computer, poi:
-
-```bash
-npm install
-npx wrangler d1 migrations apply trading-desk-db --local
-npx wrangler dev
-```
-
-Apri l'indirizzo locale mostrato da Wrangler (normalmente `http://localhost:8787`). Per il database locale Wrangler usa storage separato da D1 remoto.
-
-### Verifica dopo il deploy
-
-1. Apri la dashboard e verifica il login.
-2. La tabella mostra 10 titoli preconfigurati; all'inizio prezzi e segnali possono essere vuoti.
-3. Premi **Esegui scansione** durante l'orario regolare di mercato USA. Fuori orario la scansione viene annotata come **skipped**.
-4. Controlla la sezione **Storico scansioni**. Una scansione `success` non implica che debba esserci un'anomalia.
-5. Nella dashboard Cloudflare > Worker puoi consultare le invocazioni e i log. Le credenziali non vanno pubblicate.
-6. Verifica l'uso effettivo del piano Cloudflare: i limiti gratuiti (in particolare il CPU time per invocazione) possono richiedere riduzione dei ticker o passaggio a Workers Paid.
-
-## Architettura
-
-```
-                   ogni 15 minuti (UTC, feriali)
-                           │
-                     Worker scheduled
-                           │
-              Alpaca Paper /v2/clock
-                           │ aperto
-                 max 20 ticker attivi
-                           │
-              Alpaca /v2/stocks/{symbol}/bars
-                   timeframe=15Min feed=iex
-                           │
-                   validazione / freshness
-                           │
-                  Scout (algoritmo puro)
-                    │            │
-                  D1 bars     D1 signals
-                    └─────┬──────┘
-                          │
-           Login dashboard + API read-only (+ watchlist / manual scan)
-```
-
-### Struttura del codice
-
-```
-src/index.js          HTTP routes, scan scheduler, Alpaca API, SQL
-src/scout.js          calcolo e regole pure di analisi
-src/auth.js           autenticazione/sessioni
-src/ui.js             HTML, CSS e JS della dashboard
-migrations/0001_init.sql
-wrangler.jsonc
-.dev.vars.example
-test/*.test.js
-```
-
-### API implementate
-
-- `GET /login`, `POST /login`, `POST /logout`
-- `GET /api/overview` (dashboard)
-- `POST /api/scan` (manuale, autenticato)
-- `POST /api/watchlist` (aggiunge o riattiva ticker)
-- `DELETE /api/watchlist/{SYMBOL}` (disattiva ticker, mantiene lo storico)
-
-### Costi indicativi
-
-La base può rientrare nei livelli gratuiti di Alpaca e Cloudflare, **senza garanzia**: il costo effettivo dipende da quota CPU/requests, tariffazione e disponibilità dei dati nel tuo account. **Questa versione non utilizza ancora LLM**, quindi non ci sono costi di token AI. Non esistono costi di trading, perché gli ordini sono tecnicamente assenti.
-
-## Limitazioni importanti
-
-- Il feed **IEX non è il mercato consolidato USA**; la copertura di volumi è parziale. Un segnale di volume non rappresenta necessariamente l'intero mercato e non costituisce un'opportunità finanziaria dimostrata.
-- Le barre sono aggregate su 15 minuti; per i prezzi e i volumi sono considerate solo barre completate (più 60 secondi di assestamento). Non è un sistema di trading ad alta frequenza.
-- Il confronto sui volumi tiene conto dell'orario New York e dell'ora legale. Ci possono essere sessioni con intervalli mancanti: in quel caso Scout può rifiutare di calcolare un indicatore.
-- Il test non prova che una strategia sia profittevole. La V1 non misura costi, slippage, rendimenti, drawdown o risultati reali.
-- La watchlist non verifica automaticamente che un ticker corrisponda a un asset attualmente tradato: ticker errati o con dati mancanti non genereranno segnali e potranno causare errori in scan.
-- La protezione con password della V1 è basilare per uso personale; per una pubblicazione stabile è consigliata l'aggiunta di **Cloudflare Access**, rate limiting sul login, alert sugli errori e un dominio personalizzato. Non inserire segreti o dati sensibili nella watchlist.
-- Rispettare sempre le condizioni di uso e redistribuzione dei dati del provider. Uso soltanto personale; non esporre le API o i dati raccolti pubblicamente.
-- Il Worker può incontrare errori di rete, quote o limiti CPU. Ogni scansione registra il proprio esito: non assumere che `skipped` o `error` sia un segnale di mercato.
-- Non attivare broker reali, non usare denaro reale né inferire che un segnale `flagged` significhi comprare/vendere.
+`scout.js` (anomalie 15Min), `technical.js` (indicatori/pattern 5Min), `news.js` (normalizzazione e filtro notizie), `alerts.js` (Telegram facoltativo), `auth.js` (sessione), `index.js` (API e scansione), `ui.js` (dashboard).
 
 ## Test
 
-```bash
-npm test
-npm run check
-```
+`npm test` e `npm run check`. Test con API e database simulate, non test con credenziali reali su Cloudflare. L'installazione remota richiede la tua verifica.
 
-I test coprono fusi orari New York, soglie Scout, freshness delle barre, dati insufficienti, autenticazione, watchlist e scansioni con risposte API simulate. **Non sostituiscono un test di integrazione su Cloudflare con credenziali reali**.
-
-## Roadmap successiva (non presente in V1)
-
-1. Confronto feed IEX vs storico SIP differito, migliore sistema di data quality.
-2. News con fonti e timestamp, AI Skeptic e spiegazioni esplicabili.
-3. Chart e Sizer con parametri di rischio indipendenti dall'AI.
-4. Portafoglio virtuale reale con registro ordini simulati, P&L e controlli di esecuzione.
-5. Backtest e valutazione out-of-sample, solo dopo validazione dei dati.
-
-## Riferimenti ufficiali
-
-- Alpaca — Market Data API: https://docs.alpaca.markets/us/docs/about-market-data-api
-- Alpaca — historical stock bars: https://docs.alpaca.markets/us/reference/stockbars
-- Cloudflare — Wrangler config: https://developers.cloudflare.com/workers/wrangler/configuration/
-- Cloudflare — D1 migrations: https://developers.cloudflare.com/d1/reference/migrations/
-
-**Avvertenza:** prototipo educativo/informativo, non consulenza finanziaria. Nessun rendimento è promesso.
+Riferimento di idee: [day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill). Questa versione non incorpora automaticamente gli script Python del repository: realizza equivalenti JavaScript specifici per Cloudflare, mantenendo un perimetro di **sola osservazione**.
