@@ -11,7 +11,7 @@
     {
       "binding": "DB",
       "database_name": "trading-desk-db",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "871646f0-3533-4d8b-9e4d-7d7bc13495db",
       "migrations_dir": "migrations"
     }
   ]
