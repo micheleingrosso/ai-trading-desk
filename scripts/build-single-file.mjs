@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-const modules=['scout.js','auth.js','technical.js','news.js','alerts.js','ui.js','index.js'];
-let compiled='// AI Trading Desk 1.1 — single-file Cloudflare Worker. Auto-generated.\n';
+const modules=['scout.js','auth.js','technical.js','news.js','alerts.js','proposals.js','ui.js','index.js'];
+let compiled='// AI Trading Desk 1.2 — single-file Cloudflare Worker. Auto-generated.\n';
 for(const file of modules){
  let source=readFileSync(new URL('../src/'+file,import.meta.url),'utf8');
  source=source.replace(/^import .* from .*;\s*$/gm,'');

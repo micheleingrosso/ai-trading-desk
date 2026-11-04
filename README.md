@@ -1,37 +1,31 @@
-# AI Trading Desk 1.1 — Scout Advanced + News + Alerts
+# AI Trading Desk 1.2 — Entry • Exit • Budget • Risk • Skeptic
 
-**Aggiornamento per una installazione V1.0.1 già funzionante.** Non bisogna creare un nuovo Worker o un nuovo database. La guida operativa da seguire è **[AGGIORNAMENTO_1.1.md](AGGIORNAMENTO_1.1.md)**.
+Questa è la prosecuzione **non distruttiva** dell'app già online in V1.1. Non usare chiavi API reali nel codice e non collegare un broker di negoziazione.
 
-## Cosa fa
+**Istruzioni: [AGGIORNAMENTO_1.2.md](AGGIORNAMENTO_1.2.md)**
 
-- Mantiene le funzionalità 1.0.1: login HMAC, watchlist fino a 20 titoli, scansioni 15Min, anomalie Scout, storico D1, calendario Alpaca, cron 15 minuti, dashboard.
-- Aggiunge calcolo 5Min di RSI14 (Wilder), EMA20, SMA50, trend descrittivo, breakout del massimo delle 20 barre precedenti con filtro volume e possibile bull flag (euristica).
-- Archivia fino a 6 **nuovi eventi tecnici** per giorno di mercato, con cooldown 60 minuti per simbolo/tipo. Non genera eventi da barre non completate, dati non correnti o indicatori insufficienti.
-- Importa e deduplica articoli di notizie forniti da Alpaca, mostrando titolo, fonte, link originale, ticker e data. Non aggira paywall e non interpreta le notizie con un LLM.
-- Può notificare eventi tecnici con un solo messaggio tramite bot Telegram (se sono stati impostati i due segreti facoltativi).
-- Dashboard 1.1 con sezioni Scanner tecnico, Eventi tecnici e Notizie; dati di autenticazione, watchlist e log preesistenti conservati.
+## Aggiunte in 1.2
 
-## Limiti
+- Analisi **Entry** e **Exit**: livelli puramente indicativi per candidati long (close 5Min, stop, target 2R), senza quotazioni eseguibili.
+- **Budget** e **Risk** matematici, indipendenti dall'AI: massimo $500 esposti a titolo e $25 di perdita teorica allo stop su capitale illustrativo da $10.000.
+- **Skeptic** come modulo Workers AI opzionale (binding `AI`); può dare solo `WAIT` o `SKIP` e non ha alcuna funzione di approvazione.
+- Database storico `trade_proposals` e `proposal_audit`, migrazione additiva `0003_proposals.sql`.
+- Nuova sezione **Proposte 1.2** con livelli, obiezioni e possibilità di archiviare una scheda (non un ordine).
+- Blocco su dati vecchi, indicatori mancanti, RSI fuori soglia, esposizione eccedente, segnali duplicati o limite giornaliero superato.
 
-Questa **non** è una strategia di trading validata. Non compie ordini, non ha un broker executor e non crea un portafoglio virtuale realmente movimentato. I $10.000 mostrati nella UI sono illustrativi. Non garantisce profitto o qualità di segnale. Il feed Alpaca IEX è parziale. Alcune notizie potrebbero non essere incluse nel piano Alpaca in uso.
+## Sicurezza e limiti
 
-## Installazione
+La versione non invia ordini, né veri né virtuali. L'API Alpaca resta limitata a dati e clock. La V1.3 introdurrà in futuro il portafoglio **Paper Trading**. L'archiviazione di una scheda non autorizza e non crea alcuna operazione.
 
-Leggi `AGGIORNAMENTO_1.1.md` prima di intervenire sul Worker online. Per chi gestisce Cloudflare dal browser, sono inclusi:
+Il mercato IEX rappresenta soltanto una parte degli scambi USA; pattern di volume e prezzi possono differire dal mercato consolidato. Non è una strategia validata né una raccomandazione finanziaria.
 
-- `migrations/0002_technical_news.sql` — SQL non distruttivo da copiare nella Console D1.
-- `worker-single-file.js` — Worker completo da incollare in **Edit code → Deploy**.
-- `src/` — sorgenti modulari per Wrangler.
-- `test/` — test automatizzati eseguibili con `npm test`.
+## File principali
 
-Per Wrangler è incluso `wrangler.jsonc` con `database_id` placeholder: sostituiscilo **con il tuo UUID D1 esistente**, oppure copia il file della vecchia installazione. In nessun caso sostituire valori reali con il placeholder.
+- `worker-single-file.js`: Worker completo pronto per editor Cloudflare.
+- `migrations/0003_proposals.sql`: **solo nuova migrazione** da eseguire su D1 V1.1.
+- `src/proposals.js`: funzioni pure di Risk/Entry/Exit/Budget e modulo Skeptic.
+- `src/index.js`: integrazione delle proposte nella scansione e API di archiviazione.
+- `src/ui.js`: sezione Proposte 1.2.
+- `test/*.test.js`: test con D1 e Alpaca simulati.
 
-## Moduli
-
-`scout.js` (anomalie 15Min), `technical.js` (indicatori/pattern 5Min), `news.js` (normalizzazione e filtro notizie), `alerts.js` (Telegram facoltativo), `auth.js` (sessione), `index.js` (API e scansione), `ui.js` (dashboard).
-
-## Test
-
-`npm test` e `npm run check`. Test con API e database simulate, non test con credenziali reali su Cloudflare. L'installazione remota richiede la tua verifica.
-
-Riferimento di idee: [day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill). Questa versione non incorpora automaticamente gli script Python del repository: realizza equivalenti JavaScript specifici per Cloudflare, mantenendo un perimetro di **sola osservazione**.
+Per eseguire la suite: `npm test && npm run check` (Node.js 22+). Questi test non sostituiscono un collaudo remoto su Cloudflare.

@@ -4,8 +4,9 @@ import { dashboardHtml, loginHtml, appCss, appJs } from './ui.js';
 import { calculateTechnical, TECH_CONFIG } from './technical.js';
 import { normalizeNews, buildNewsUrl } from './news.js';
 import { sendTelegram } from './alerts.js';
+import { buildProposal, skepticReview, PROPOSAL_RULES } from './proposals.js';
 
-// Only read-only market data endpoints are used. NO broker order API endpoints in V1.1.
+// Only read-only market data endpoints are used. NO broker order API endpoints in V1.2.
 const DATA_BASE = 'https://data.alpaca.markets/v2';
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -118,6 +119,53 @@ async function fetchNews(env, symbols) {
   return articles.length;
 }
 
+// Proposal creation only; idempotent, fail-closed and entirely separate from order execution.
+async function createInformationProposals(env, outcomes, today) {
+  const stats={created:0,ignored:0,errors:0};
+  let num=Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM trade_proposals WHERE trade_date=?').bind(today).first())?.n||0);
+  let pending=Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM trade_proposals WHERE status IN ('WAIT','SKIP')").first())?.n||0);
+  for(const o of outcomes) {
+    if(o.error||!o.technical?.ok||pending>=PROPOSAL_RULES.maxPending||num>=PROPOSAL_RULES.maxPerDay)continue;
+    const candidate=buildProposal(o.technical,new Date());
+    if(!candidate.ok){stats.ignored++;continue;}
+    try {
+      // Deliberately only one proposal per ticker per day in the early prototype.
+      const prev=await env.DB.prepare('SELECT id FROM trade_proposals WHERE symbol=? AND trade_date=? LIMIT 1').bind(o.symbol,today).first();
+      if(prev)continue;
+      // Only give the AI a small bounded list of headlines; they are untrusted context.
+      const news=await env.DB.prepare('SELECT headline FROM news_items WHERE symbols_json LIKE ? AND published_at>=? ORDER BY published_at DESC LIMIT 3')
+        .bind('%"'+o.symbol+'"%',new Date(Date.now()-86400000).toISOString()).all();
+      const skeptic=await skepticReview(env,o.symbol,candidate,(news.results||[]).map(x=>x.headline));
+      const id=crypto.randomUUID();
+      const res=await env.DB.prepare(`INSERT OR IGNORE INTO trade_proposals
+        (id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,
+        shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,
+        skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id,o.symbol,candidate.barTs,today,candidate.sourceEvent,
+        candidate.entry,candidate.stop,candidate.target,candidate.quantity,candidate.notional,candidate.lossAtStop,
+        candidate.riskReward,candidate.rationale,JSON.stringify(candidate.cautions),JSON.stringify(candidate.technical),
+        skeptic.mode,skeptic.verdict,JSON.stringify(skeptic.counterarguments),skeptic.verdict,iso()).run();
+      if(res.meta?.changes){num++;pending++;stats.created++;}
+    } catch(e) {stats.errors++;console.error('Proposal failure',o.symbol,String(e?.message||e).slice(0,160));}
+  }
+  return stats;
+}
+
+async function archiveInformationProposal(request, env, id) {
+  if(!/^[0-9a-f]{8}-[0-9a-f-]{27,36}$/i.test(id))return err('ID non valido');
+  let input;
+  try{input=await request.json();}catch{return err('JSON non valido');}
+  if(input?.action!=='archive')return err('Azione non consentita');
+  const note=String(input.note||'').trim().slice(0,200);
+  // Archiving is not an approval and never creates an order or a position.
+  const res=await env.DB.prepare("UPDATE trade_proposals SET status='ARCHIVED',reviewed_at=?,review_note=? WHERE id=? AND status IN ('WAIT','SKIP')")
+    .bind(iso(),note,id).run();
+  if(!res.meta?.changes)return err('Proposta inesistente o già archiviata',409);
+  await env.DB.prepare('INSERT INTO proposal_audit(id,proposal_id,action,detail,created_at) VALUES(?,?,?,?,?)')
+    .bind(crypto.randomUUID(),id,'ARCHIVED',note,iso()).run();
+  return json({ok:true,status:'ARCHIVED'});
+}
+
 async function tryLock(env) {
   const owner = crypto.randomUUID();
   const now = Date.now();
@@ -146,7 +194,7 @@ export async function runScan(env, source = 'manual') {
   const owner = await tryLock(env);
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
-  let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0;
+  let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0, proposals = 0, proposalErrors=0;
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
@@ -217,8 +265,12 @@ export async function runScan(env, source = 'manual') {
       // News source is optional in V1.1; market data can still work.
       newsError=`News non disponibili: ${String(e?.message||e).slice(0,100)}`;
     }
+    // No proposals from incomplete/noncurrent data; risk rules apply before Skeptic.
+    const pstats=await createInformationProposals(env,outcomes,today);
+    proposals=pstats.created;proposalErrors=pstats.errors;
     const telegram=await sendTelegram(env,newEvents);
-    const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie` +
+    const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
+      (proposalErrors?` · ${proposalErrors} errori proposte`:``) +
       (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'');
     status = errors.length ? (checked ? 'partial' : 'error') : 'success';
     detail = (errors.length ? errors.slice(0, 5).join(' | ') :
@@ -238,7 +290,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals, technical, technicalEvents, news] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -249,7 +301,8 @@ async function overview(env) {
     env.DB.prepare(`SELECT COUNT(*) AS count FROM signals`).first(),
     env.DB.prepare(`SELECT symbol,bar_ts,close,rsi14,ema20,sma50,high20,volume_ratio20,trend,breakout,bull_flag_candidate,updated_at FROM technical_snapshots ORDER BY symbol`).all(),
     env.DB.prepare(`SELECT symbol,bar_ts,kind,description,price,rsi14,volume_ratio20,created_at FROM technical_events ORDER BY created_at DESC LIMIT 30`).all(),
-    env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all()
+    env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all(),
+    env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all()
   ]);
   return {
     mode: 'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
@@ -258,8 +311,11 @@ async function overview(env) {
     technical: technical.results || [], technicalEvents: technicalEvents.results || [],
     news: (news.results||[]).map(n=>({...n,symbols:JSON.parse(n.symbols_json||'[]'),symbols_json:undefined})),
     alertsConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+    proposals: (proposals.results||[]).map(p=>({...p,cautions:JSON.parse(p.cautions_json||'[]'),skepticReasons:JSON.parse(p.skeptic_reasons_json||'[]'),technical:JSON.parse(p.technical_json||'{}'),cautions_json:undefined,skeptic_reasons_json:undefined,technical_json:undefined})),
+    skepticConfigured: Boolean(env.AI && typeof env.AI.run==='function'),
+    proposalRules: PROPOSAL_RULES,
     totalSignals: totals?.count || 0,
-    positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.1.
+    positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.2.
     virtualBalance: 10000, // Display-only illustrative value; not a simulated portfolio ledger.
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };
@@ -308,6 +364,10 @@ export default {
         }
         if (request.method === 'GET' && pathname === '/') response = staticResponse(dashboardHtml, 'text/html; charset=utf-8');
         else if (request.method === 'GET' && pathname === '/api/overview') response = json(await overview(env));
+        else if (request.method === 'POST' && /^\/api\/proposals\/[0-9a-f-]+\/archive$/i.test(pathname)) {
+          response = !isSameOrigin(request) ? err('Origine non valida',403) :
+            await archiveInformationProposal(request,env,pathname.split('/')[3]);
+        }
         else if (request.method === 'POST' && pathname === '/logout') {
           response = !isSameOrigin(request) ? err('Origine non valida', 403) :
             redirect('/login', { 'Set-Cookie': expiredSessionCookie(request) });
