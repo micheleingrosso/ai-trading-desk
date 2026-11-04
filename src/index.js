@@ -6,8 +6,9 @@ import { normalizeNews, buildNewsUrl } from './news.js';
 import { sendTelegram } from './alerts.js';
 import { buildProposal, skepticReview, PROPOSAL_RULES } from './proposals.js';
 import { normalizePaperAccount, paperBudget } from './paper.js';
+import { readRuntime, updateRuntime, runPaperAutomation, paperDashboard, flushTelegramEvents, queueEvent } from './paper-executor.js';
 
-// Only read-only data/account endpoints are used. NO broker order API endpoints in V1.2.1.
+// Data/account endpoints remain read-only. V1.3 isolated executor uses Alpaca PAPER ONLY (disabled by default).
 const DATA_BASE = 'https://data.alpaca.markets/v2';
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -206,7 +207,7 @@ export async function runScan(env, source = 'manual') {
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
   let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0, proposals = 0, proposalErrors=0;
-  let budget=null,accountNote='';
+  let budget=null,accountNote='',paperAccount=null;
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
@@ -214,6 +215,7 @@ export async function runScan(env, source = 'manual') {
     // Re-read Alpaca Paper every scan. Missing account data MUST NEVER lead to using a fake budget.
     try{
       const account=await alpacaPaperAccount(env);
+      paperAccount=account;
       await recordPaperSnapshot(env,account);
       if(account.eligibleForInformationalSizing)budget=paperBudget(account);
       else accountNote='Conto Paper sospeso o liquidità non idonea: proposte bloccate';
@@ -290,6 +292,10 @@ export async function runScan(env, source = 'manual') {
     // No proposals from incomplete/noncurrent data; risk rules apply before Skeptic.
     const pstats=await createInformationProposals(env,outcomes,today,budget);
     proposals=pstats.created;proposalErrors=pstats.errors;
+    // Only after deterministic indicators, account and risk checks. Disabled unless explicitly armed.
+    const paperResult=source==='cron' ?
+      await runPaperAutomation(env,{outcomes,account:paperAccount,date:today}) :
+      await runPaperAutomation(env); // Manual Scout button NEVER places a Paper order.
     const telegram=await sendTelegram(env,newEvents);
     const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
       (proposalErrors?` · ${proposalErrors} errori proposte`:``) +
@@ -312,7 +318,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper, paperExecution] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -326,7 +332,8 @@ async function overview(env) {
     env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all(),
     env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all(),
     env.DB.prepare('SELECT snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status FROM paper_account_snapshots ORDER BY snapshot_at DESC LIMIT 1').first(),
-    env.DB.prepare('SELECT snapshot_at,equity FROM paper_account_snapshots ORDER BY snapshot_at ASC LIMIT 1').first()
+    env.DB.prepare('SELECT snapshot_at,equity FROM paper_account_snapshots ORDER BY snapshot_at ASC LIMIT 1').first(),
+    paperDashboard(env)
   ]);
   // Do not silently show stale snapshots as if they were current.
   let account=null,accountError=null;
@@ -340,7 +347,7 @@ async function overview(env) {
     Math.round((currentEquity-startingEquity)*100)/100:null;
   const balanceChangePct=account && balanceChange!==null?Math.round((balanceChange/startingEquity)*10000)/100:null;
   return {
-    mode: 'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
+    mode: paperExecution.settings.enabled&&paperExecution.settings.armed?'AUTO_PAPER':'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
     time: iso(), rules: SCOUT_RULES,
     watchlist: watch.results || [], signals: signals.results || [], scans: scans.results || [],
     technical: technical.results || [], technicalEvents: technicalEvents.results || [],
@@ -360,7 +367,8 @@ async function overview(env) {
       maxRisk:account.equity*PROPOSAL_RULES.maxLossFraction
     }:null,
     totalSignals: totals?.count || 0,
-    positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.2.
+    paperExecution,
+    positions: paperExecution.summary.active, orders: paperExecution.summary.total,
     virtualBalance: account?.equity??null, // Live read-only Alpaca PAPER equity, no fake fallback.
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };
@@ -413,6 +421,34 @@ export default {
           response = !isSameOrigin(request) ? err('Origine non valida',403) :
             await archiveInformationProposal(request,env,pathname.split('/')[3]);
         }
+        else if (request.method === 'POST' && pathname === '/api/paper/settings') {
+          if(!isSameOrigin(request))response=err('Origine non valida',403);
+          else {
+            let input;try{input=await request.json();}catch{input=null;}
+            if(!input||!['enable','pause'].includes(input.action))response=err('Azione non valida');
+            else if(input.action==='enable' && input.confirm!=='ENABLE_PAPER_ONLY')response=err('Conferma Paper mancante',400);
+            else {
+              try {
+                await updateRuntime(env,input.action==='enable',input.action==='enable'?'Abilitato manualmente dal proprietario':'Pausa manuale');
+                await queueEvent(env,null,'MODE:'+crypto.randomUUID(),'MODE',input.action==='enable'?'🟢 AUTO PAPER abilitato dalla dashboard. MAI denaro reale.':'⏸ AUTO PAPER in pausa: non saranno inviati nuovi ingressi. Le uscite bracket esistenti rimangono attive su Alpaca Paper.');
+                await flushTelegramEvents(env);
+                response=json({ok:true,mode:input.action});
+              }catch(e){response=err(String(e.message).slice(0,170),409);}
+            }
+          }
+        }
+        else if (request.method === 'POST' && pathname === '/api/paper/telegram-test') {
+          if(!isSameOrigin(request))response=err('Origine non valida',403);
+          else if(!env.TELEGRAM_BOT_TOKEN||!env.TELEGRAM_CHAT_ID)response=err('Configura prima TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID',409);
+          else {
+            await queueEvent(env,null,'TEST:'+crypto.randomUUID(),'TEST','✅ AI Trading Desk 1.3 · messaggio di prova. Collegamento Telegram pronto per gli eventi Alpaca PAPER. Nessun ordine effettuato.');
+            const sent=await flushTelegramEvents(env);
+            response=json({ok:true,telegram:sent});
+          }
+        }
+        else if (request.method === 'POST' && pathname === '/api/paper/reconcile') {
+          response = !isSameOrigin(request) ? err('Origine non valida',403) : json(await runPaperAutomation(env));
+        }
         else if (request.method === 'POST' && pathname === '/logout') {
           response = !isSameOrigin(request) ? err('Origine non valida', 403) :
             redirect('/login', { 'Set-Cookie': expiredSessionCookie(request) });
@@ -434,8 +470,8 @@ export default {
     return response;
   },
   async scheduled(_event, env, ctx) {
-    ctx.waitUntil(runScan(env, 'cron').catch(e => {
-      console.error('Scheduled scan failed', String(e?.message || e).slice(0,250));
-    }));
+    // Every 5 minutes: monitor Alpaca fills and send Telegram. Every 15: also scan.
+    const task=new Date().getUTCMinutes()%15===0?runScan(env,'cron'):runPaperAutomation(env);
+    ctx.waitUntil(task.catch(e=>console.error('Paper/Scout cron failed',String(e?.message||e).slice(0,240))));
   }
 };

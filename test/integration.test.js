@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker, {runScan} from '../src/index.js';
 
-const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
+const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
 function mockD1() {
   const database = new DatabaseSync(':memory:');
   database.exec(sql);

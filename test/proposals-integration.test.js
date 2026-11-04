@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync} from 'node:fs';
 import worker,{runScan} from '../src/index.js';
-const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql'];
+const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'];
 function createDB(){
  const raw=new DatabaseSync(':memory:');
  for(const m of migrations)raw.exec(readFileSync(new URL('../migrations/'+m,import.meta.url),'utf8'));
