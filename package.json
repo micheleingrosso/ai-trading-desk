@@ -1,6 +1,6 @@
 {
   "name": "ai-trading-desk-v1",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "Scout + market data + Cloudflare D1 dashboard. Paper-only informational prototype.",

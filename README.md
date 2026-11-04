@@ -1,6 +1,8 @@
-# AI Trading Desk — Scout 1.0
+# AI Trading Desk — Scout 1.0.1 (correzione login)
 
 **Prototipo operativo di monitoraggio informativo, per uso personale.** La V1.0 non è un broker, non genera ordini e non fa paper trading effettivo: serve a raccogliere dati, rilevare anomalie, tenerne uno storico e verificare che la base tecnica funzioni.
+
+> **Aggiornamento 1.0.1:** corretto errore `Origine richiesta non valida` dopo il login in browser con `Origin: null`, causato dalla combinazione tra form POST e `Referrer-Policy: no-referrer`. È mantenuto il controllo delle richieste cross-origin. Per aggiornare un Worker già pubblicato usare `npx wrangler deploy` dalla cartella del progetto; non eliminare D1 e non modificare i segreti.
 
 ## Include
 

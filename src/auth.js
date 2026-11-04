@@ -55,6 +55,22 @@ export function expiredSessionCookie(request) {
   return `${sessionName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure}`;
 }
 export function isSameOrigin(request) {
+  const expected = new URL(request.url).origin;
   const origin = request.headers.get('Origin');
-  return Boolean(origin && origin === new URL(request.url).origin);
+  // When present and non-null, Origin always takes precedence.
+  if (origin && origin !== 'null') return origin === expected;
+
+  // A privacy-sensitive browser or an older cached login form can send
+  // Origin: null. Browsers protect Sec-Fetch-* against modification by JS.
+  const fetchSite = request.headers.get('Sec-Fetch-Site');
+  if (fetchSite !== null) return fetchSite === 'same-origin';
+
+  // Older browsers without Fetch Metadata may provide a Referer.
+  const referer = request.headers.get('Referer');
+  if (referer) {
+    try { return new URL(referer).origin === expected; }
+    catch { return false; }
+  }
+  // Fail closed when the browser provides no reliable origin context.
+  return false;
 }
