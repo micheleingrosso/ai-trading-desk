@@ -1,7 +1,6 @@
 // 1.2 — Deterministic, informational entry/exit/budget/risk proposals.
 // Absolutely no broker order API calls. No portfolio accounting.
 export const PROPOSAL_RULES = Object.freeze({
-  referenceCapital: 10000,
   maxNotionalFraction: 0.05,
   maxLossFraction: 0.0025,
   maxStopPct: 0.02,
@@ -19,8 +18,12 @@ export const PROPOSAL_RULES = Object.freeze({
 });
 const r2=n=>Math.round((n + Number.EPSILON)*100)/100;
 const isNum = v => typeof v==='number' && Number.isFinite(v);
-export function buildProposal(technical, now=new Date()) {
+export function buildProposal(technical, now=new Date(), budget=null) {
   const reasons=[],cautions=[];
+  // Critical: no static $10k fallback. Always source equity and cash from verified Paper account.
+  if (!budget || !(Number.isFinite(budget.equity) && budget.equity>0) ||
+      !(Number.isFinite(budget.cashNoLeverage) && budget.cashNoLeverage>0))
+    return {ok:false,reason:'Budget Alpaca Paper non disponibile: proposta bloccata'};
   if(!technical || !technical.ok) return {ok:false,reason:'Indicatori tecnici assenti o incompleti'};
   if(!isNum(Date.parse(technical.barTs)))return {ok:false,reason:'Timestamp barra non valido'};
   const ageMinutes=(now.getTime()-Date.parse(technical.barTs)-5*60_000)/60_000;
@@ -40,8 +43,8 @@ export function buildProposal(technical, now=new Date()) {
   const perShare=r2(entry-stop);
   if(stop<=0||perShare<=0||stop>=entry||target<=entry || perShare/entry>PROPOSAL_RULES.maxStopPct)
     return {ok:false,reason:'Livelli di uscita non validi o troppo vicini al tick'};
-  const maxNotional=PROPOSAL_RULES.referenceCapital*PROPOSAL_RULES.maxNotionalFraction;
-  const maxRisk=PROPOSAL_RULES.referenceCapital*PROPOSAL_RULES.maxLossFraction;
+  const maxNotional=Math.min(budget.equity*PROPOSAL_RULES.maxNotionalFraction,budget.cashNoLeverage);
+  const maxRisk=budget.equity*PROPOSAL_RULES.maxLossFraction;
   const quantity=Math.min(Math.floor(maxNotional/entry),Math.floor(maxRisk/perShare));
   if(quantity<1)return {ok:false,reason:'La posizione minima supera i limiti di esposizione'};
   const notional=r2(quantity*entry),lossAtStop=r2(quantity*perShare);
@@ -53,6 +56,7 @@ export function buildProposal(technical, now=new Date()) {
   cautions.push('Gap, spread, slippage, news ed earnings possono invalidare stop e target.');
   return {ok:true,sourceEvent:technical.breakout?'BREAKOUT_20':'BULL_FLAG_CANDIDATE',barTs:technical.barTs,
     entry,stop,target,quantity,notional,lossAtStop,riskReward:PROPOSAL_RULES.rewardRiskMultiple,
+    paperEquity:budget.equity,paperCash:budget.cashNoLeverage,
     rationale:reasons.join(' · '),cautions,technical:{rsi14:technical.rsi14,ema20:technical.ema20,sma50:technical.sma50,volumeRatio20:technical.volumeRatio20}};
 }
 

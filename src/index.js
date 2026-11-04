@@ -5,8 +5,9 @@ import { calculateTechnical, TECH_CONFIG } from './technical.js';
 import { normalizeNews, buildNewsUrl } from './news.js';
 import { sendTelegram } from './alerts.js';
 import { buildProposal, skepticReview, PROPOSAL_RULES } from './proposals.js';
+import { normalizePaperAccount, paperBudget } from './paper.js';
 
-// Only read-only market data endpoints are used. NO broker order API endpoints in V1.2.
+// Only read-only data/account endpoints are used. NO broker order API endpoints in V1.2.1.
 const DATA_BASE = 'https://data.alpaca.markets/v2';
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -41,6 +42,15 @@ async function alpacaFetch(env, url) {
   return response.json();
 }
 async function alpacaClock(env) { return alpacaFetch(env, `${PAPER_BASE}/clock`); }
+async function alpacaPaperAccount(env) { return normalizePaperAccount(await alpacaFetch(env, `${PAPER_BASE}/account`)); }
+async function recordPaperSnapshot(env,account) {
+  // Snapshot the entire Alpaca Paper account independently of our trading strategy.
+  await env.DB.prepare(`INSERT INTO paper_account_snapshots
+    (id,snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status,blocked)
+    VALUES(?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),iso(),account.equity,account.cash,
+      account.buyingPower,account.cashNoLeverage,account.previousEquity,account.status,
+      account.blocked?1:0).run();
+}
 async function alpacaBars(env, symbol) {
   const url = new URL(`${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars`);
   url.searchParams.set('timeframe', '15Min');
@@ -120,13 +130,14 @@ async function fetchNews(env, symbols) {
 }
 
 // Proposal creation only; idempotent, fail-closed and entirely separate from order execution.
-async function createInformationProposals(env, outcomes, today) {
+async function createInformationProposals(env, outcomes, today, budget) {
   const stats={created:0,ignored:0,errors:0};
+  if (!budget) return {...stats,reason:"Account Paper non disponibile: nessuna proposta creata"};
   let num=Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM trade_proposals WHERE trade_date=?').bind(today).first())?.n||0);
   let pending=Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM trade_proposals WHERE status IN ('WAIT','SKIP')").first())?.n||0);
   for(const o of outcomes) {
     if(o.error||!o.technical?.ok||pending>=PROPOSAL_RULES.maxPending||num>=PROPOSAL_RULES.maxPerDay)continue;
-    const candidate=buildProposal(o.technical,new Date());
+    const candidate=buildProposal(o.technical,new Date(),budget);
     if(!candidate.ok){stats.ignored++;continue;}
     try {
       // Deliberately only one proposal per ticker per day in the early prototype.
@@ -195,14 +206,25 @@ export async function runScan(env, source = 'manual') {
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
   let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0, proposals = 0, proposalErrors=0;
+  let budget=null,accountNote='';
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
     recorded = true;
+    // Re-read Alpaca Paper every scan. Missing account data MUST NEVER lead to using a fake budget.
+    try{
+      const account=await alpacaPaperAccount(env);
+      await recordPaperSnapshot(env,account);
+      if(account.eligibleForInformationalSizing)budget=paperBudget(account);
+      else accountNote='Conto Paper sospeso o liquidità non idonea: proposte bloccate';
+    }catch(e){
+      accountNote='Saldo Alpaca Paper non verificabile: proposte bloccate';
+      console.error('Paper account sync failed:',String(e?.message||e).slice(0,160));
+    }
     const clock = await alpacaClock(env);
     if (!clock.is_open) {
       status = 'skipped';
-      detail = `Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}`;
+      detail = `Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}` + (accountNote?' · '+accountNote:'');
       return { status, detail, symbols_checked: 0, alerts_created: 0 };
     }
     const watchlist = await env.DB.prepare('SELECT symbol FROM watchlist WHERE enabled=1 ORDER BY symbol LIMIT 20').all();
@@ -266,12 +288,12 @@ export async function runScan(env, source = 'manual') {
       newsError=`News non disponibili: ${String(e?.message||e).slice(0,100)}`;
     }
     // No proposals from incomplete/noncurrent data; risk rules apply before Skeptic.
-    const pstats=await createInformationProposals(env,outcomes,today);
+    const pstats=await createInformationProposals(env,outcomes,today,budget);
     proposals=pstats.created;proposalErrors=pstats.errors;
     const telegram=await sendTelegram(env,newEvents);
     const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
       (proposalErrors?` · ${proposalErrors} errori proposte`:``) +
-      (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'');
+      (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'') + (accountNote?` · ${accountNote}`:'');
     status = errors.length ? (checked ? 'partial' : 'error') : 'success';
     detail = (errors.length ? errors.slice(0, 5).join(' | ') :
       `Controllati ${checked}/${symbols.length} titoli · feed IEX · ${alerts} anomalie Scout`) + suffix;
@@ -290,7 +312,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -302,8 +324,21 @@ async function overview(env) {
     env.DB.prepare(`SELECT symbol,bar_ts,close,rsi14,ema20,sma50,high20,volume_ratio20,trend,breakout,bull_flag_candidate,updated_at FROM technical_snapshots ORDER BY symbol`).all(),
     env.DB.prepare(`SELECT symbol,bar_ts,kind,description,price,rsi14,volume_ratio20,created_at FROM technical_events ORDER BY created_at DESC LIMIT 30`).all(),
     env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all(),
-    env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all()
+    env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all(),
+    env.DB.prepare('SELECT snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status FROM paper_account_snapshots ORDER BY snapshot_at DESC LIMIT 1').first(),
+    env.DB.prepare('SELECT snapshot_at,equity FROM paper_account_snapshots ORDER BY snapshot_at ASC LIMIT 1').first()
   ]);
+  // Do not silently show stale snapshots as if they were current.
+  let account=null,accountError=null;
+  try{account=await alpacaPaperAccount(env);}catch(e){
+    accountError='Sincronizzazione Alpaca Paper non riuscita. Ultimo snapshot mostrato separatamente.';
+    console.error('Alpaca Paper dashboard unavailable:',String(e?.message||e).slice(0,160));
+  }
+  const startingEquity=Number(firstPaper?.equity);
+  const currentEquity=Number(account?.equity);
+  const balanceChange=account && Number.isFinite(startingEquity) && startingEquity>0 ?
+    Math.round((currentEquity-startingEquity)*100)/100:null;
+  const balanceChangePct=account && balanceChange!==null?Math.round((balanceChange/startingEquity)*10000)/100:null;
   return {
     mode: 'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
     time: iso(), rules: SCOUT_RULES,
@@ -314,9 +349,19 @@ async function overview(env) {
     proposals: (proposals.results||[]).map(p=>({...p,cautions:JSON.parse(p.cautions_json||'[]'),skepticReasons:JSON.parse(p.skeptic_reasons_json||'[]'),technical:JSON.parse(p.technical_json||'{}'),cautions_json:undefined,skeptic_reasons_json:undefined,technical_json:undefined})),
     skepticConfigured: Boolean(env.AI && typeof env.AI.run==='function'),
     proposalRules: PROPOSAL_RULES,
+    paperAccount:account?{...account,asOf:iso()}:null,
+    paperAccountError:accountError,
+    paperLastSnapshot:lastPaper||null,
+    paperFirstSnapshot:firstPaper||null,
+    paperBalanceChange:balanceChange,
+    paperBalanceChangePct:balanceChangePct,
+    paperSizing:account?.eligibleForInformationalSizing?{
+      equity:account.equity,maxNotional:Math.min(account.cashNoLeverage,account.equity*PROPOSAL_RULES.maxNotionalFraction),
+      maxRisk:account.equity*PROPOSAL_RULES.maxLossFraction
+    }:null,
     totalSignals: totals?.count || 0,
     positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.2.
-    virtualBalance: 10000, // Display-only illustrative value; not a simulated portfolio ledger.
+    virtualBalance: account?.equity??null, // Live read-only Alpaca PAPER equity, no fake fallback.
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };
 }

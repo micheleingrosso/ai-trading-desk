@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync} from 'node:fs';
 import worker,{runScan} from '../src/index.js';
-const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql'];
+const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql'];
 function createDB(){
  const raw=new DatabaseSync(':memory:');
  for(const m of migrations)raw.exec(readFileSync(new URL('../migrations/'+m,import.meta.url),'utf8'));
@@ -69,6 +69,7 @@ test('market-open scanner creates a single fresh information proposal, never an 
  globalThis.fetch=async(input)=>{
   const u=String(input);urls.push(u);
   if(u.endsWith('/clock'))return Response.json({is_open:true});
+  if(u.endsWith('/account'))return Response.json({equity:'100000',cash:'100000',buying_power:'200000',status:'ACTIVE',currency:'USD'});
   if(u.includes('/v1beta1/news'))return Response.json({news:[]});
   if(u.includes('timeframe=5Min')){const data=bars5.map(x=>({...x}));if(u.includes('/AAPL/')){const b=data.at(-1);b.c+=1;b.o=b.c-0.1;b.h=b.c+0.07;b.l=b.c-0.2;b.v=3000;}return Response.json({bars:data});}
   return Response.json({bars:[]});
@@ -81,7 +82,7 @@ test('market-open scanner creates a single fresh information proposal, never an 
   assert.equal(record.symbol,'AAPL');assert.equal(record.skeptic_mode,'RULES_ONLY');
   assert.equal(record.skeptic_verdict,'WAIT');
   assert.equal(record.status,'WAIT');
-  assert.ok(record.notional<=500&&record.loss_at_stop<=25);
+  assert.ok(record.notional<=5000&&record.loss_at_stop<=250);
   assert.ok(urls.every(url=>!url.includes('/orders')&&!url.includes('api.alpaca.markets/v2/orders')));
   const repeat=await runScan(env,'manual');assert.equal(repeat.status,'success');
   assert.equal(raw.prepare('SELECT COUNT(*) n FROM trade_proposals').get().n,count);

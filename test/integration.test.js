@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker, {runScan} from '../src/index.js';
 
-const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
+const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
 function mockD1() {
   const database = new DatabaseSync(':memory:');
   database.exec(sql);
@@ -43,7 +43,8 @@ test('new deployment has watchlist, no signals, no orders; login is protected',a
  assert.equal(payload.enabledCount,10);
  assert.equal(payload.signals.length,0);
  assert.equal(payload.orders,0);
- assert.equal(payload.virtualBalance,10000);
+ assert.equal(payload.virtualBalance,null);
+ assert.equal(payload.paperAccount,null);
  const changed=await worker.fetch(request('/api/watchlist',{method:'POST',headers:{Cookie:cookie,Origin:origin,'Content-Type':'application/json'},body:JSON.stringify({symbol:'ORCL'})}),config);
  assert.equal(changed.status,200);
  const after=await worker.fetch(request('/api/overview',{headers:{Cookie:cookie}}),config);
@@ -63,7 +64,9 @@ test('market closed schedules a safe skip; no broker order request',async()=>{
   assert.equal(out.alerts_created,0);
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM signals').get().n,0);
   assert.equal(database.prepare('SELECT status FROM scan_runs').get().status,'skipped');
-  assert.deepEqual(requests,['https://paper-api.alpaca.markets/v2/clock']);
+  assert.ok(requests.includes('https://paper-api.alpaca.markets/v2/account'));
+  assert.ok(requests.includes('https://paper-api.alpaca.markets/v2/clock'));
+  assert.ok(requests.every(x=>!x.includes('/orders')));
  }finally{globalThis.fetch=oldFetch;}
 });
 
@@ -73,6 +76,7 @@ test('open market checks 10 symbols using market-data API only',async()=>{
  globalThis.fetch=async(input)=>{
   calls.push(String(input));
   if(String(input).endsWith('/clock'))return Response.json({is_open:true});
+  if(String(input).endsWith('/account'))return Response.json({equity:'100000',cash:'100000',buying_power:'200000',status:'ACTIVE',currency:'USD'});
   if(String(input).includes('/v1beta1/news'))return Response.json({news:[]});
   return Response.json({bars:[],next_page_token:null});
  };
@@ -81,8 +85,8 @@ test('open market checks 10 symbols using market-data API only',async()=>{
   assert.equal(result.status,'success');
   assert.equal(result.symbols_checked,10);
   assert.equal(result.alerts_created,0);
-  assert.equal(calls.length,22);
-  assert.ok(calls.slice(1,-1).every(x=>x.includes('data.alpaca.markets/v2/stocks/')&&x.includes('feed=iex')));
+  assert.equal(calls.length,23);
+  assert.ok(calls.filter(x=>x.includes('data.alpaca.markets/v2/stocks/')).length===20);
   assert.ok(calls.at(-1).includes('/v1beta1/news'));
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM news_items').get().n,0);
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM signals').get().n,0);
@@ -121,6 +125,7 @@ test('end-to-end v1.1 saves RSI, breakout and sourced news without submitting or
  globalThis.fetch=async(input)=>{
    const u=String(input);urls.push(u);
    if(u.endsWith('/clock'))return Response.json({is_open:true});
+   if(u.endsWith('/account'))return Response.json({equity:'100000',cash:'100000',buying_power:'200000',status:'ACTIVE',currency:'USD'});
    if(u.includes('/v1beta1/news'))return Response.json({news:[{
      id:123,headline:'Earnings report published',source:'financial-wire',
      created_at:fixed,url:'https://example.org/news',symbols:['AAPL']

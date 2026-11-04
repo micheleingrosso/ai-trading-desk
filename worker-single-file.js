@@ -1,4 +1,4 @@
-// AI Trading Desk 1.2 — single-file Cloudflare Worker. Auto-generated.
+// AI Trading Desk 1.2.1 — single-file Cloudflare Worker. Auto-generated.
 
 // ---- scout.js ----
 // Scout v1: pure, reproducible market metrics. Not a trading recommendation.
@@ -334,7 +334,6 @@ async function sendTelegram(env, events, sender=fetch) {
 // 1.2 — Deterministic, informational entry/exit/budget/risk proposals.
 // Absolutely no broker order API calls. No portfolio accounting.
 const PROPOSAL_RULES = Object.freeze({
-  referenceCapital: 10000,
   maxNotionalFraction: 0.05,
   maxLossFraction: 0.0025,
   maxStopPct: 0.02,
@@ -352,8 +351,12 @@ const PROPOSAL_RULES = Object.freeze({
 });
 const r2=n=>Math.round((n + Number.EPSILON)*100)/100;
 const isNum = v => typeof v==='number' && Number.isFinite(v);
-function buildProposal(technical, now=new Date()) {
+function buildProposal(technical, now=new Date(), budget=null) {
   const reasons=[],cautions=[];
+  // Critical: no static $10k fallback. Always source equity and cash from verified Paper account.
+  if (!budget || !(Number.isFinite(budget.equity) && budget.equity>0) ||
+      !(Number.isFinite(budget.cashNoLeverage) && budget.cashNoLeverage>0))
+    return {ok:false,reason:'Budget Alpaca Paper non disponibile: proposta bloccata'};
   if(!technical || !technical.ok) return {ok:false,reason:'Indicatori tecnici assenti o incompleti'};
   if(!isNum(Date.parse(technical.barTs)))return {ok:false,reason:'Timestamp barra non valido'};
   const ageMinutes=(now.getTime()-Date.parse(technical.barTs)-5*60_000)/60_000;
@@ -373,8 +376,8 @@ function buildProposal(technical, now=new Date()) {
   const perShare=r2(entry-stop);
   if(stop<=0||perShare<=0||stop>=entry||target<=entry || perShare/entry>PROPOSAL_RULES.maxStopPct)
     return {ok:false,reason:'Livelli di uscita non validi o troppo vicini al tick'};
-  const maxNotional=PROPOSAL_RULES.referenceCapital*PROPOSAL_RULES.maxNotionalFraction;
-  const maxRisk=PROPOSAL_RULES.referenceCapital*PROPOSAL_RULES.maxLossFraction;
+  const maxNotional=Math.min(budget.equity*PROPOSAL_RULES.maxNotionalFraction,budget.cashNoLeverage);
+  const maxRisk=budget.equity*PROPOSAL_RULES.maxLossFraction;
   const quantity=Math.min(Math.floor(maxNotional/entry),Math.floor(maxRisk/perShare));
   if(quantity<1)return {ok:false,reason:'La posizione minima supera i limiti di esposizione'};
   const notional=r2(quantity*entry),lossAtStop=r2(quantity*perShare);
@@ -386,6 +389,7 @@ function buildProposal(technical, now=new Date()) {
   cautions.push('Gap, spread, slippage, news ed earnings possono invalidare stop e target.');
   return {ok:true,sourceEvent:technical.breakout?'BREAKOUT_20':'BULL_FLAG_CANDIDATE',barTs:technical.barTs,
     entry,stop,target,quantity,notional,lossAtStop,riskReward:PROPOSAL_RULES.rewardRiskMultiple,
+    paperEquity:budget.equity,paperCash:budget.cashNoLeverage,
     rationale:reasons.join(' · '),cautions,technical:{rsi14:technical.rsi14,ema20:technical.ema20,sma50:technical.sma50,volumeRatio20:technical.volumeRatio20}};
 }
 
@@ -413,25 +417,73 @@ async function skepticReview(env, symbol, proposal, newsHeadlines=[]) {
 }
 
 
+// ---- paper.js ----
+// 1.2.1 — Read-only Alpaca Paper account normalization (never place orders).
+const strictNumber=(v,field)=>{
+  if(v===null || v===undefined || String(v).trim()==='') throw new Error(`Alpaca: ${field} assente`);
+  const n=Number(v);
+  if(!Number.isFinite(n))throw new Error(`Alpaca: ${field} non numerico`);
+  return n;
+};
+function normalizePaperAccount(data){
+  if(!data || typeof data!=='object' || Array.isArray(data))throw new Error('Risposta account Alpaca non valida');
+  const equity=strictNumber(data.equity,'equity');
+  const cash=strictNumber(data.cash,'cash');
+  const buyingPower=strictNumber(data.buying_power,'buying_power');
+  const previousEquity=(data.last_equity==null?null:strictNumber(data.last_equity,'last_equity'));
+  if(equity<=0 || equity>1e12)throw new Error('Equity Paper non valida');
+  if(data.currency && data.currency!=='USD')throw new Error('Valuta Alpaca inattesa');
+  const blocked=Boolean(data.account_blocked || data.trading_blocked || data.trade_suspended_by_user);
+  // Do not use margin buying power.  A positive cash figure alone is not permission to trade:
+  // proposed order execution will independently revalidate live account and open orders.
+  const cashNoLeverage=Math.max(0,Math.min(cash,equity));
+  const status=String(data.status||'UNKNOWN');
+  return {
+    connected:true,source:'ALPACA_PAPER',currency:'USD',equity,cash,buyingPower,
+    cashNoLeverage,previousEquity,portfolioValue:data.portfolio_value==null?equity:strictNumber(data.portfolio_value,'portfolio_value'),
+    longMarketValue:Math.max(0,Number(data.long_market_value||0)),
+    status,blocked,
+    // This is not a live-trading readiness flag; this version is read-only.
+    eligibleForInformationalSizing:!blocked && cashNoLeverage>0 && ['ACTIVE','PAPER_ONLY'].includes(status)
+  };
+}
+function paperBudget(account){
+  if(!account?.connected || !account.eligibleForInformationalSizing)throw new Error('Conto Paper non idoneo al dimensionamento');
+  const equity=Number(account.equity),cash=Number(account.cashNoLeverage);
+  if(!(equity>0) || !(cash>0) || !Number.isFinite(equity)||!Number.isFinite(cash))throw new Error('Equity/cash non valida');
+  return {equity,cashNoLeverage:Math.min(cash,equity)};
+}
+
+
 // ---- ui.js ----
 const loginHtml = `<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Accesso · AI Trading Desk</title><link rel="stylesheet" href="/assets/app.css"></head>
 <body class="login-page"><main class="login-card"><div class="brand"><span class="brand-icon">A<span class="brand-dot">●</span></span><span>AI TRADING <strong>DESK</strong></span></div><span class="eyebrow">AMBIENTE PRIVATO</span><h1>Benvenuto nel tuo trading desk.</h1><p class="muted">Scout monitora le anomalie di mercato. Nessuna operazione reale o simulata viene eseguita da questa versione.</p><!--login-error--><form method="post" action="/login"><label for="password">Password della dashboard</label><input id="password" name="password" type="password" autocomplete="current-password" required placeholder="La tua password privata"><button class="btn primary" type="submit">Accedi alla dashboard <span>↗</span></button></form><div class="note"><strong>Solo osservazione.</strong> Non inserire chiavi API o credenziali del broker in questa pagina.</div></main></body></html>`;
 
-const dashboardHtml = `<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AI Trading Desk · 1.2</title><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script></head><body>
+const dashboardHtml = `<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>AI Trading Desk · 1.2.1</title><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script></head><body>
 <div class="layout"><aside class="sidebar"><div class="brand"><span class="brand-icon">A<span class="brand-dot">●</span></span><span>AI TRADING <strong>DESK</strong></span></div><div class="sidebar-kicker">WORKSPACE / 01</div><nav aria-label="Navigazione principale"><a class="nav-item current" href="/"><span class="nav-sym">▦</span> Panoramica</a><a class="nav-item" href="#watch-section"><span class="nav-sym">◈</span> Watchlist</a><a class="nav-item" href="#signals-section"><span class="nav-sym">⌁</span> Anomalie Scout</a><a class="nav-item" href="#technical-section"><span class="nav-sym">⌁</span> Scanner tecnico</a><a class="nav-item" href="#proposals-section"><span class="nav-sym">◇</span> Proposte 1.2</a><a class="nav-item" href="#news-section"><span class="nav-sym">◉</span> Notizie</a><a class="nav-item" href="#log-section"><span class="nav-sym">▤</span> Log scansioni</a></nav><div class="side-bottom"><div class="safe-box"><span class="safe-dot"></span><div><strong>Safe mode attiva</strong><small>Trading disabilitato</small></div></div><form method="post" action="/logout"><button type="submit" class="logout">Esci dall'account ↗</button></form></div></aside>
 <main class="content"><header class="topbar"><div><div class="eyebrow">CONTROL ROOM <span class="kicker-sep">/</span> MARKET SCOUT</div><h1>Trading overview<span class="tiny-period">.</span></h1><p class="subtitle">Segnali informativi di mercato. Niente ordini, niente denaro reale.</p></div><div class="header-actions"><div class="badge-outline"><span class="pulse"></span> OBSERVATION ONLY</div><button class="btn primary" id="scan-button">↻ Esegui scansione</button></div></header>
 <div class="status-line"><span id="live-state">Caricamento dati…</span><span id="asof"></span></div>
-<section class="stats" aria-label="Statistiche"><article class="stat"><span class="stat-label">CAPITALE DI RIFERIMENTO</span><strong id="virtual-balance">$10,000.00</strong><small>Illustrativo, non movimentato</small><div class="stat-line lblue"></div></article><article class="stat"><span class="stat-label">TITOLI MONITORATI</span><strong id="enabled-count">—</strong><small>Fino a 20 nella watchlist</small><div class="stat-line lcyan"></div></article><article class="stat"><span class="stat-label">ANOMALIE REGISTRATE</span><strong id="signals-count">—</strong><small>Segnali ≠ raccomandazioni</small><div class="stat-line lpurple"></div></article><article class="stat"><span class="stat-label">ORDINI / POSIZIONI</span><strong>0 / 0</strong><small>Esecuzione disabilitata in V1.2</small><div class="stat-line lgreen"></div></article></section>
+<section class="stats" aria-label="Statistiche"><article class="stat"><span class="stat-label">PATRIMONIO ALPACA PAPER</span><strong id="virtual-balance">—</strong><small id="paper-sync-state">Sincronizzazione Alpaca in corso</small><div class="stat-line lblue"></div></article><article class="stat"><span class="stat-label">TITOLI MONITORATI</span><strong id="enabled-count">—</strong><small>Fino a 20 nella watchlist</small><div class="stat-line lcyan"></div></article><article class="stat"><span class="stat-label">ANOMALIE REGISTRATE</span><strong id="signals-count">—</strong><small>Segnali ≠ raccomandazioni</small><div class="stat-line lpurple"></div></article><article class="stat"><span class="stat-label">ORDINI / POSIZIONI</span><strong>0 / 0</strong><small>Esecuzione disabilitata in V1.2.1</small><div class="stat-line lgreen"></div></article></section>
+<section class="panel wide" id="paper-account-section"><div class="panel-head"><div><span class="eyebrow">PAPER ACCOUNT / ALPACA</span><h2>Patrimonio e limiti del simulatore</h2></div><span class="soft-tag">SOLA LETTURA · NESSUN ORDINE</span></div>
+<div class="paper-overview-grid">
+<div><small>Liquidità cash</small><strong id="paper-cash">—</strong></div>
+<div><small>Buying power (può includere leva)</small><strong id="paper-buying-power">—</strong></div>
+<div><small>Liquidità senza leva</small><strong id="paper-usable-cash">—</strong></div>
+<div><small>Massimo per proposta 5%</small><strong id="paper-max-notional">—</strong></div>
+<div><small>Rischio teorico 0,25%</small><strong id="paper-max-risk">—</strong></div>
+<div><small>Variazione conto dal primo snapshot</small><strong id="paper-change">—</strong></div>
+</div><p class="mini-info" id="paper-account-info">Dati direttamente da Alpaca Paper. Variazione del conto ≠ performance attribuibile al bot: il bot non apre ancora ordini.</p></section>
 <section class="grid-main"><div class="panel" id="watch-section"><div class="panel-head"><div><span class="eyebrow">LIVE MONITOR</span><h2>Watchlist</h2></div><div class="panel-actions"><span class="soft-tag">FEED: IEX</span></div></div><div class="table-scroll"><table><thead><tr><th>TITOLO</th><th>ULTIMO CLOSE</th><th>VOLUME 15M</th><th>DATA BARRA</th><th>AZIONI</th></tr></thead><tbody id="watch-body"><tr><td colspan="5" class="empty">Caricamento watchlist…</td></tr></tbody></table></div><form class="watch-form" id="watch-form"><label for="symbol-input">Aggiungi un titolo alla watchlist</label><div class="form-row"><input id="symbol-input" maxlength="10" placeholder="Ticker, es. ORCL" autocomplete="off" required><button type="submit" class="btn light">+ Aggiungi</button></div></form></div>
 <div class="right-stack"><section class="panel compact"><div class="panel-head"><div><span class="eyebrow">SYSTEM HEALTH</span><h2>Stato monitoraggio</h2></div><span class="health-light" id="health-light"></span></div><div class="health-grid"><span>Ultimo controllo</span><strong id="last-run-at">—</strong><span>Esito</span><strong id="last-run-status">—</strong><span>Simboli controllati</span><strong id="last-run-count">—</strong><span>Nuove anomalie</span><strong id="last-run-alerts">—</strong></div><p class="mini-info" id="last-run-detail">In attesa del primo controllo.</p></section><section class="panel compact"><div class="panel-head"><div><span class="eyebrow">SCOUT / RULES</span><h2>Soglie attive</h2></div></div><div class="rule"><div><strong>±3%</strong><small>Movimento 1 ora</small></div><span>oppure</span><div><strong>2.0×</strong><small>Volume fascia oraria</small></div></div><p class="mini-info">Confronto sulla mediana dello stesso intervallo di 15 minuti degli ultimi 5 giorni disponibili. Feed IEX parziale; almeno 3 giorni validi per il controllo volumi.</p></section></div></section>
 <section class="panel wide" id="technical-section"><div class="panel-head"><div><span class="eyebrow">TECHNICAL SCANNER / 5 MIN</span><h2>Indicatori e pattern</h2></div><span class="soft-tag">RSI14 · EMA20 · SMA50 · BREAKOUT</span></div><p class="mini-info intro-note">Analisi algoritmica di barre IEX completate. I pattern sono ipotesi descrittive, non segnali operativi; dati mancanti o vecchi non generano eventi.</p><div class="table-scroll"><table><thead><tr><th>TITOLO</th><th>RSI 14</th><th>EMA 20</th><th>SMA 50</th><th>TREND</th><th>PATTERN</th><th>ULTIMA BARRA</th></tr></thead><tbody id="technical-body"><tr><td colspan="7" class="empty">Caricamento indicatori…</td></tr></tbody></table></div><div class="panel-head subhead"><div><span class="eyebrow">EVENT HISTORY</span><h2>Eventi tecnici registrati</h2></div><span class="soft-tag">MAX 6 / GIORNO</span></div><div id="technical-events" class="signal-list"><p class="empty">Nessun evento tecnico.</p></div></section>
-<section class="panel wide" id="proposals-section"><div class="panel-head"><div><span class="eyebrow">ENTRY / EXIT / RISK / SKEPTIC</span><h2>Proposte informative</h2></div><span class="soft-tag" id="skeptic-status">SKEPTIC: SOLO REGOLE</span></div><p class="mini-info intro-note">Livelli teorici sul close delle barre 5m IEX, non quotazioni eseguibili. Massimo 5% del capitale illustrativo per proposta e perdita teorica allo stop ≤0,25%. Skeptic può soltanto opporsi. Nessun ordine, nessun portafoglio realmente movimentato. «Archivia» significa soltanto chiudere la scheda informativa.</p><div id="proposals-list" class="proposal-list"><p class="empty">Nessuna proposta disponibile. Servono dati correnti, un pattern convalidato e i controlli di rischio superati.</p></div></section>
+<section class="panel wide" id="proposals-section"><div class="panel-head"><div><span class="eyebrow">ENTRY / EXIT / RISK / SKEPTIC</span><h2>Proposte informative</h2></div><span class="soft-tag" id="skeptic-status">SKEPTIC: SOLO REGOLE</span></div><p class="mini-info intro-note">Livelli teorici sul close delle barre 5m IEX, non quotazioni eseguibili. Massimo 5% del patrimonio Alpaca Paper per proposta e perdita teorica allo stop ≤0,25%. Nessuna leva finanziaria; il dimensionamento non supera la liquidità disponibile. Skeptic può soltanto opporsi. Nessun ordine, nessun portafoglio realmente movimentato. «Archivia» significa soltanto chiudere la scheda informativa.</p><div id="proposals-list" class="proposal-list"><p class="empty">Nessuna proposta disponibile. Servono dati correnti, un pattern convalidato e i controlli di rischio superati.</p></div></section>
 <section class="panel wide" id="news-section"><div class="panel-head"><div><span class="eyebrow">NEWS FEED / ALPACA</span><h2>Notizie monitorate</h2></div><span class="soft-tag" id="telegram-status">TELEGRAM: NON CONFIGURATO</span></div><p class="mini-info intro-note">Titoli e fonti originali di notizie pertinenti alla watchlist. Nessun modello AI le interpreta ancora: l'analisi semantica arriverà in una fase successiva.</p><div class="news-grid" id="news-list"><p class="empty">Non ci sono notizie salvate.</p></div></section>
 <section class="panel wide" id="signals-section"><div class="panel-head"><div><span class="eyebrow">OPPORTUNITY RADAR</span><h2>Anomalie rilevate</h2></div><span class="soft-tag">ULTIMI 30 EVENTI</span></div><div class="signal-list" id="signals-list"><p class="empty">Non ci sono ancora anomalie registrate.</p></div></section>
 <section class="panel wide" id="log-section"><div class="panel-head"><div><span class="eyebrow">SYSTEM AUDIT</span><h2>Storico scansioni</h2></div></div><div class="table-scroll"><table><thead><tr><th>DATA / ORA</th><th>ORIGINE</th><th>STATO</th><th>TITOLI</th><th>NUOVE ANOMALIE</th></tr></thead><tbody id="logs-body"><tr><td colspan="5" class="empty">Nessuna scansione disponibile.</td></tr></tbody></table></div></section>
-<footer>AI TRADING DESK · SCOUT 1.2 <span>•</span> Analisi algoritmica informativa. Non sono presenti funzioni di negoziazione e la performance non è misurata.</footer></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div></body></html>`;
+<footer>AI TRADING DESK · SCOUT 1.2.1 <span>•</span> Analisi informativa. Saldi sincronizzati da Alpaca Paper, nessun ordine inviato e performance del bot non ancora misurabile.</footer></main></div><div id="toast" class="toast" role="status" aria-live="polite"></div></body></html>`;
 
 const appCss = `
+.paper-overview-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.paper-overview-grid>div{background:#101e30;border:1px solid #2a415a;border-radius:10px;padding:15px;display:flex;flex-direction:column;gap:8px}.paper-overview-grid small{font-size:10px;color:#8aa0b8}.paper-overview-grid strong{font-size:20px;font-variant-numeric:tabular-nums;color:#dcecf9}@media(max-width:750px){.paper-overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:430px){.paper-overview-grid{grid-template-columns:1fr}}
 .proposal-list{display:grid;gap:13px}.proposal-card{border:1px solid #2a4258;background:#112138;padding:18px;border-radius:12px}.proposal-top,.proposal-bottom{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.proposal-kpis{display:grid;grid-template-columns:repeat(5,minmax(90px,1fr));gap:10px;margin:15px 0}.proposal-kpis div{background:#0b1929;padding:12px;border-radius:8px}.proposal-kpis small{font-size:10px;display:block;color:#91a5b9}.proposal-kpis strong{display:block;margin-top:5px}.proposal-risks{margin:8px 0;color:#abc0d1;line-height:1.7;padding-left:21px}.proposal-muted{color:#95aac4;font-size:12px;line-height:1.6}.mini-button-danger{color:#e0b2b8}.proposal-card .mini-button{margin-top:6px}@media(max-width:800px){.proposal-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 :root{color-scheme:dark;--bg:#0b1220;--sidebar:#0d1728;--panel:#121e31;--panel2:#142237;--border:#26354a;--txt:#eaf0fc;--muted:#94a2b9;--sky:#6de2e4;--violet:#b497ff;--green:#8eeab7;--red:#fb999e;--warning:#efc58d}
@@ -441,7 +493,7 @@ const appCss = `
 
 const appJs = `
 const $ = id => document.getElementById(id);
-const money = n => Number.isFinite(Number(n)) ? '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—';
+const money = n => n!==null && n!==undefined && n!=='' && Number.isFinite(Number(n)) ? '$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—';
 const integer = n => Number.isFinite(Number(n)) ? Number(n).toLocaleString('it-IT') : '—';
 const fmtDate = x => x ? new Date(x).toLocaleString('it-IT',{timeZone:'Europe/Rome',day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
 function el(tag,txt='',className=''){const node=document.createElement(tag);node.textContent=txt;if(className)node.className=className;return node;}
@@ -544,7 +596,19 @@ function drawLogs(scans){
  for(const s of scans){const tr=el('tr');cell(tr,fmtDate(s.started_at));cell(tr,s.source==='cron'?'Automatica':'Manuale');cell(tr,s.status);cell(tr,integer(s.symbols_checked));cell(tr,integer(s.alerts_created));root.appendChild(tr);}
 }
 function drawState(data){
- $('virtual-balance').textContent=money(data.virtualBalance);
+ const acct=data.paperAccount;
+ $('virtual-balance').textContent=money(acct?.equity);
+ $('paper-sync-state').textContent=acct?'Alpaca Paper · aggiornato '+fmtDate(acct.asOf):'Conto non disponibile · nessun budget fittizio';
+ $('paper-cash').textContent=money(acct?.cash);
+ $('paper-buying-power').textContent=money(acct?.buyingPower);
+ $('paper-usable-cash').textContent=money(acct?.cashNoLeverage);
+ $('paper-max-notional').textContent=money(data.paperSizing?.maxNotional);
+ $('paper-max-risk').textContent=money(data.paperSizing?.maxRisk);
+ $('paper-change').textContent=data.paperBalanceChange==null?'—':
+   ((data.paperBalanceChange>=0?'+':'')+money(data.paperBalanceChange)+' ('+((data.paperBalanceChangePct??0)>=0?'+':'')+(data.paperBalanceChangePct??0).toFixed(2)+'%)');
+ $('paper-account-info').textContent=acct?
+  ('Stato Alpaca: '+acct.status+(acct.blocked?' · conto bloccato':'')+' · I dati includono tutte le operazioni del conto, anche quelle non effettuate dal bot. La variazione parte dal primo snapshot salvato: '+fmtDate(data.paperFirstSnapshot?.snapshot_at)+'. Nessun ordine eseguito da questa versione.'):
+  (data.paperAccountError||'Sincronizzazione Paper non disponibile')+' · Ultimo snapshot: '+fmtDate(data.paperLastSnapshot?.snapshot_at)+'. Proposte di trading bloccate fino al ripristino.';
  $('enabled-count').textContent=String(data.enabledCount);
  $('signals-count').textContent=integer(data.totalSignals);
  $('asof').textContent='Aggiornato: '+fmtDate(data.time);
@@ -588,7 +652,8 @@ refresh();setInterval(refresh,60000);
 
 
 
-// Only read-only market data endpoints are used. NO broker order API endpoints in V1.2.
+
+// Only read-only data/account endpoints are used. NO broker order API endpoints in V1.2.1.
 const DATA_BASE = 'https://data.alpaca.markets/v2';
 const PAPER_BASE = 'https://paper-api.alpaca.markets/v2';
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
@@ -623,6 +688,15 @@ async function alpacaFetch(env, url) {
   return response.json();
 }
 async function alpacaClock(env) { return alpacaFetch(env, `${PAPER_BASE}/clock`); }
+async function alpacaPaperAccount(env) { return normalizePaperAccount(await alpacaFetch(env, `${PAPER_BASE}/account`)); }
+async function recordPaperSnapshot(env,account) {
+  // Snapshot the entire Alpaca Paper account independently of our trading strategy.
+  await env.DB.prepare(`INSERT INTO paper_account_snapshots
+    (id,snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status,blocked)
+    VALUES(?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),iso(),account.equity,account.cash,
+      account.buyingPower,account.cashNoLeverage,account.previousEquity,account.status,
+      account.blocked?1:0).run();
+}
 async function alpacaBars(env, symbol) {
   const url = new URL(`${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars`);
   url.searchParams.set('timeframe', '15Min');
@@ -702,13 +776,14 @@ async function fetchNews(env, symbols) {
 }
 
 // Proposal creation only; idempotent, fail-closed and entirely separate from order execution.
-async function createInformationProposals(env, outcomes, today) {
+async function createInformationProposals(env, outcomes, today, budget) {
   const stats={created:0,ignored:0,errors:0};
+  if (!budget) return {...stats,reason:"Account Paper non disponibile: nessuna proposta creata"};
   let num=Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM trade_proposals WHERE trade_date=?').bind(today).first())?.n||0);
   let pending=Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM trade_proposals WHERE status IN ('WAIT','SKIP')").first())?.n||0);
   for(const o of outcomes) {
     if(o.error||!o.technical?.ok||pending>=PROPOSAL_RULES.maxPending||num>=PROPOSAL_RULES.maxPerDay)continue;
-    const candidate=buildProposal(o.technical,new Date());
+    const candidate=buildProposal(o.technical,new Date(),budget);
     if(!candidate.ok){stats.ignored++;continue;}
     try {
       // Deliberately only one proposal per ticker per day in the early prototype.
@@ -777,14 +852,25 @@ export async function runScan(env, source = 'manual') {
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
   let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0, proposals = 0, proposalErrors=0;
+  let budget=null,accountNote='';
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
     recorded = true;
+    // Re-read Alpaca Paper every scan. Missing account data MUST NEVER lead to using a fake budget.
+    try{
+      const account=await alpacaPaperAccount(env);
+      await recordPaperSnapshot(env,account);
+      if(account.eligibleForInformationalSizing)budget=paperBudget(account);
+      else accountNote='Conto Paper sospeso o liquidità non idonea: proposte bloccate';
+    }catch(e){
+      accountNote='Saldo Alpaca Paper non verificabile: proposte bloccate';
+      console.error('Paper account sync failed:',String(e?.message||e).slice(0,160));
+    }
     const clock = await alpacaClock(env);
     if (!clock.is_open) {
       status = 'skipped';
-      detail = `Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}`;
+      detail = `Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}` + (accountNote?' · '+accountNote:'');
       return { status, detail, symbols_checked: 0, alerts_created: 0 };
     }
     const watchlist = await env.DB.prepare('SELECT symbol FROM watchlist WHERE enabled=1 ORDER BY symbol LIMIT 20').all();
@@ -848,12 +934,12 @@ export async function runScan(env, source = 'manual') {
       newsError=`News non disponibili: ${String(e?.message||e).slice(0,100)}`;
     }
     // No proposals from incomplete/noncurrent data; risk rules apply before Skeptic.
-    const pstats=await createInformationProposals(env,outcomes,today);
+    const pstats=await createInformationProposals(env,outcomes,today,budget);
     proposals=pstats.created;proposalErrors=pstats.errors;
     const telegram=await sendTelegram(env,newEvents);
     const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
       (proposalErrors?` · ${proposalErrors} errori proposte`:``) +
-      (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'');
+      (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'') + (accountNote?` · ${accountNote}`:'');
     status = errors.length ? (checked ? 'partial' : 'error') : 'success';
     detail = (errors.length ? errors.slice(0, 5).join(' | ') :
       `Controllati ${checked}/${symbols.length} titoli · feed IEX · ${alerts} anomalie Scout`) + suffix;
@@ -872,7 +958,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -884,8 +970,21 @@ async function overview(env) {
     env.DB.prepare(`SELECT symbol,bar_ts,close,rsi14,ema20,sma50,high20,volume_ratio20,trend,breakout,bull_flag_candidate,updated_at FROM technical_snapshots ORDER BY symbol`).all(),
     env.DB.prepare(`SELECT symbol,bar_ts,kind,description,price,rsi14,volume_ratio20,created_at FROM technical_events ORDER BY created_at DESC LIMIT 30`).all(),
     env.DB.prepare(`SELECT article_id,headline,source,source_url,published_at,symbols_json FROM news_items ORDER BY published_at DESC LIMIT 30`).all(),
-    env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all()
+    env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all(),
+    env.DB.prepare('SELECT snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status FROM paper_account_snapshots ORDER BY snapshot_at DESC LIMIT 1').first(),
+    env.DB.prepare('SELECT snapshot_at,equity FROM paper_account_snapshots ORDER BY snapshot_at ASC LIMIT 1').first()
   ]);
+  // Do not silently show stale snapshots as if they were current.
+  let account=null,accountError=null;
+  try{account=await alpacaPaperAccount(env);}catch(e){
+    accountError='Sincronizzazione Alpaca Paper non riuscita. Ultimo snapshot mostrato separatamente.';
+    console.error('Alpaca Paper dashboard unavailable:',String(e?.message||e).slice(0,160));
+  }
+  const startingEquity=Number(firstPaper?.equity);
+  const currentEquity=Number(account?.equity);
+  const balanceChange=account && Number.isFinite(startingEquity) && startingEquity>0 ?
+    Math.round((currentEquity-startingEquity)*100)/100:null;
+  const balanceChangePct=account && balanceChange!==null?Math.round((balanceChange/startingEquity)*10000)/100:null;
   return {
     mode: 'OBSERVATION_ONLY', source: 'Alpaca IEX (copertura parziale)',
     time: iso(), rules: SCOUT_RULES,
@@ -896,9 +995,19 @@ async function overview(env) {
     proposals: (proposals.results||[]).map(p=>({...p,cautions:JSON.parse(p.cautions_json||'[]'),skepticReasons:JSON.parse(p.skeptic_reasons_json||'[]'),technical:JSON.parse(p.technical_json||'{}'),cautions_json:undefined,skeptic_reasons_json:undefined,technical_json:undefined})),
     skepticConfigured: Boolean(env.AI && typeof env.AI.run==='function'),
     proposalRules: PROPOSAL_RULES,
+    paperAccount:account?{...account,asOf:iso()}:null,
+    paperAccountError:accountError,
+    paperLastSnapshot:lastPaper||null,
+    paperFirstSnapshot:firstPaper||null,
+    paperBalanceChange:balanceChange,
+    paperBalanceChangePct:balanceChangePct,
+    paperSizing:account?.eligibleForInformationalSizing?{
+      equity:account.equity,maxNotional:Math.min(account.cashNoLeverage,account.equity*PROPOSAL_RULES.maxNotionalFraction),
+      maxRisk:account.equity*PROPOSAL_RULES.maxLossFraction
+    }:null,
     totalSignals: totals?.count || 0,
     positions: 0, orders: 0, // Explicit: trading/executor is NOT implemented in V1.2.
-    virtualBalance: 10000, // Display-only illustrative value; not a simulated portfolio ledger.
+    virtualBalance: account?.equity??null, // Live read-only Alpaca PAPER equity, no fake fallback.
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };
 }
