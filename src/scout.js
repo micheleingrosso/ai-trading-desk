@@ -7,7 +7,7 @@ export const SCOUT_RULES = Object.freeze({
   minimumBaselineDays: 3,
   minimumBaselineVolume: 100,
   minimumCurrentVolume: 1000,
-  maxSignalsPerDay: 5,
+  maxSignalsPerDay: 15,
   cooldownMinutes: 60,
   intervalMinutes: 15,
   dataSettleSeconds: 60,

@@ -12,7 +12,7 @@ export const EXECUTION_RULES = Object.freeze({
   maxPositionFraction: 0.05, maxRiskFraction: 0.0025,
   maxEntryMarkupFraction: 0.0015,
   minWorstCaseRewardRisk: 1.70,
-  minMinutesBeforeClose: 30,
+  minMinutesBeforeClose: 30, minNyEntryTime:'09:46',
   maxPendingMinutes: 20,
   maxReconcileAgeMinutes: 15,
 });
@@ -73,10 +73,14 @@ export function bracketPayload(symbol,order,clientOrderId){
 export async function readRuntime(env){
   const row=await env.DB.prepare('SELECT enabled,paused_reason,day_key,day_start_equity,changed_at FROM paper_runtime WHERE id=1').first();
   if(!row)throw new Error('Migrazione 0005_paper_execution.sql mancante');
-  return {enabled:row.enabled===1,armed:paperArmed(env),reason:row.paused_reason,dayKey:row.day_key,dayStartEquity:row.day_start_equity,changedAt:row.changed_at};
+  const guard=await env.DB.prepare('SELECT validated FROM release_guard WHERE id=1').first();
+  const releaseValidated=guard?.validated===1;
+  return {enabled:row.enabled===1 && releaseValidated,armed:paperArmed(env)&&releaseValidated,
+    releaseValidated,reason:releaseValidated?row.paused_reason:'Upgrade 1.3.1 non ancora collaudato',
+    dayKey:row.day_key,dayStartEquity:row.day_start_equity,changedAt:row.changed_at};
 }
 export async function updateRuntime(env,enabled,reason,by='dashboard'){
-  if(enabled && !paperArmed(env))throw new Error('Segreto PAPER_AUTOTRADE_ARM non impostato a PAPER_ONLY');
+  if(enabled && !(await readRuntime(env)).armed)throw new Error('Upgrade 1.3.1 non collaudato oppure segreto PAPER_AUTOTRADE_ARM mancante');
   await env.DB.prepare('UPDATE paper_runtime SET enabled=?,paused_reason=?,changed_at=?,changed_by=? WHERE id=1')
     .bind(enabled?1:0,reason||'',paperIso(),by).run();
 }
@@ -243,6 +247,8 @@ async function attemptPaperOrder(env,outcomes,account,date){
   if(!account?.eligibleForInformationalSizing)return {status:'BLOCKED',reason:'Conto non idoneo'};
   const clock=await paperRequest(env,'/clock');
   if(!clock.is_open)return {status:'CLOSED'};
+  if(partsNY(new Date().toISOString(),new Map()).slot<EXECUTION_RULES.minNyEntryTime)
+    return {status:'WAIT',reason:'Attendere i primi 15 minuti dopo l’apertura USA'};
   if(!clock.next_close || Date.parse(clock.next_close)-Date.now()<EXECUTION_RULES.minMinutesBeforeClose*60000)return {status:'BLOCKED',reason:'Troppo vicino alla chiusura'};
   await resetDayIfNeeded(env,account,date);
   const state=await readRuntime(env);
@@ -303,6 +309,9 @@ async function attemptPaperOrder(env,outcomes,account,date){
 async function maybeDailySummary(env){
   const now=partsNY(new Date().toISOString(),new Map());
   if(now.regular || now.weekday==='Sat'||now.weekday==='Sun' || now.slot<'16:05'||now.slot>'17:30')return;
+  const prior=await env.DB.prepare('SELECT 1 AS exists_flag FROM paper_trade_events WHERE event_key=?')
+    .bind('DAY:'+now.date).first();
+  if(prior)return;
   const n=await env.DB.prepare(`SELECT COUNT(*) AS total,
     COALESCE(SUM(CASE WHEN order_status='CLOSED' THEN realized_pnl ELSE 0 END),0) AS pnl,
     SUM(CASE WHEN order_status='CLOSED' THEN 1 ELSE 0 END) AS closed

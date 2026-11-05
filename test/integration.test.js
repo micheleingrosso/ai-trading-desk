@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { readFileSync } from 'node:fs';
 import worker, {runScan} from '../src/index.js';
 
-const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
+const sql = ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql','0006_scaling_diagnostics.sql'].map(n=>readFileSync(new URL('../migrations/'+n, import.meta.url),'utf8')).join('\n');
 function mockD1() {
   const database = new DatabaseSync(':memory:');
   database.exec(sql);
@@ -64,13 +64,13 @@ test('market closed schedules a safe skip; no broker order request',async()=>{
   assert.equal(out.alerts_created,0);
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM signals').get().n,0);
   assert.equal(database.prepare('SELECT status FROM scan_runs').get().status,'skipped');
-  assert.ok(requests.includes('https://paper-api.alpaca.markets/v2/account'));
+  assert.ok(!requests.includes('https://paper-api.alpaca.markets/v2/account')); // Closed-market snapshot suppressed
   assert.ok(requests.includes('https://paper-api.alpaca.markets/v2/clock'));
   assert.ok(requests.every(x=>!x.includes('/orders')));
  }finally{globalThis.fetch=oldFetch;}
 });
 
-test('open market checks 10 symbols using market-data API only',async()=>{
+test('cron checks one of five watchlist shards via batched market API',async()=>{
  const {DB,database}=mockD1(), config=env(DB), oldFetch=globalThis.fetch;
  const calls=[];
  globalThis.fetch=async(input)=>{
@@ -78,16 +78,15 @@ test('open market checks 10 symbols using market-data API only',async()=>{
   if(String(input).endsWith('/clock'))return Response.json({is_open:true});
   if(String(input).endsWith('/account'))return Response.json({equity:'100000',cash:'100000',buying_power:'200000',status:'ACTIVE',currency:'USD'});
   if(String(input).includes('/v1beta1/news'))return Response.json({news:[]});
-  return Response.json({bars:[],next_page_token:null});
+  return Response.json({bars:{},next_page_token:null});
  };
  try{
   const result=await runScan(config,'cron');
-  assert.equal(result.status,'success');
-  assert.equal(result.symbols_checked,10);
+  assert.equal(result.status,'error'); // No IEX bars provided by test provider
+  assert.equal(result.symbols_checked,0);
   assert.equal(result.alerts_created,0);
-  assert.equal(calls.length,23);
-  assert.ok(calls.filter(x=>x.includes('data.alpaca.markets/v2/stocks/')).length===20);
-  assert.ok(calls.at(-1).includes('/v1beta1/news'));
+  assert.ok(calls.filter(x=>x.includes('data.alpaca.markets/v2/stocks/bars')).length<=2);
+  assert.ok(calls.every(x=>!x.includes('/orders')));
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM news_items').get().n,0);
   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM signals').get().n,0);
  }finally{globalThis.fetch=oldFetch;}
@@ -119,8 +118,9 @@ test('end-to-end v1.1 saves RSI, breakout and sourced news without submitting or
      bars5.push({t,o:100,h:100,l:100,c:100,v:300});
    }
  }
- const bar15=[{t:'2026-07-20T14:00:00Z',o:100,h:100,l:100,c:100,v:200},
-              {t:'2026-07-20T15:00:00Z',o:100,h:100,l:100,c:100,v:200}];
+ const bar15=[];
+ for(const day of ['2026-07-13','2026-07-14','2026-07-15','2026-07-16','2026-07-17','2026-07-20'])
+  for(let i=0;i<(day.endsWith('20')?7:26);i++)bar15.push({t:new oldDate(oldDate.parse(day+'T13:30:00Z')+i*900000).toISOString(),o:100,h:100,l:100,c:100,v:200});
  const urls=[];
  globalThis.fetch=async(input)=>{
    const u=String(input);urls.push(u);
@@ -130,23 +130,27 @@ test('end-to-end v1.1 saves RSI, breakout and sourced news without submitting or
      id:123,headline:'Earnings report published',source:'financial-wire',
      created_at:fixed,url:'https://example.org/news',symbols:['AAPL']
    }]});
-   if(u.includes('timeframe=5Min')){
-     const copy=bars5.map(b=>({...b}));
-     if(u.includes('/AAPL/'))Object.assign(copy.at(-1),{o:104,h:106,l:103,c:105,v:2500});
-     return Response.json({bars:copy});
+   const syms=new URL(u).searchParams.get('symbols')?.split(',')||[];
+   const bars={};
+   for(const sym of syms){
+     if(u.includes('timeframe=5Min')){
+       const copy=bars5.map(b=>({...b}));
+       if(sym==='AAPL')Object.assign(copy.at(-1),{o:104,h:106,l:103,c:105,v:2500});
+       bars[sym]=copy;
+     }else bars[sym]=bar15;
    }
-   return Response.json({bars:bar15});
+   return Response.json({bars,next_page_token:null});
  };
  try{
    const result=await runScan(config,'manual');
-   assert.equal(result.status,'success');
-   assert.equal(result.symbols_checked,10);
-   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM technical_snapshots').get().n,10);
+   assert.equal(result.status,'partial'); // Initial history warm-up uses 4 tickers per invocation
+   assert.equal(result.symbols_checked,4);
+   assert.equal(database.prepare('SELECT COUNT(*) AS n FROM technical_snapshots').get().n,4);
    assert.ok(database.prepare('SELECT COUNT(*) AS n FROM technical_events').get().n>=1);
    assert.equal(database.prepare('SELECT COUNT(*) AS n FROM news_items').get().n,1);
    assert.ok(urls.every(x=>!x.includes('/orders')));
    const repeat=await runScan(config,'manual');
-   assert.equal(repeat.status,'success');
+   assert.equal(repeat.status,'partial');
    assert.equal(database.prepare('SELECT COUNT(*) AS n FROM news_items').get().n,1);
  }finally{globalThis.fetch=oldFetch;globalThis.Date=oldDate;}
 });

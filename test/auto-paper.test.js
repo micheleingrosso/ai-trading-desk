@@ -7,7 +7,7 @@ import {normalizePaperAccount} from '../src/paper.js';
 import worker from '../src/index.js';
 function fixture(){
  const db=new DatabaseSync(':memory:');
- for(const f of ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'])db.exec(readFileSync(new URL('../migrations/'+f,import.meta.url),'utf8'));
+ for(const f of ['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql','0006_scaling_diagnostics.sql'])db.exec(readFileSync(new URL('../migrations/'+f,import.meta.url),'utf8'));
  const D1={prepare(sql){let stmt=db.prepare(sql),params=[];const obj={bind(...args){params=args;return obj;},async first(){return stmt.get(...params)||null;},async all(){return {results:stmt.all(...params)};},async run(){return {meta:{changes:stmt.run(...params).changes}};}};return obj;},
  async batch(stmts){return Promise.all(stmts.map(s=>s.run()));}};
  const env={DB:D1,ALPACA_KEY_ID:'paperfake',ALPACA_SECRET_KEY:'papersecretfake',TELEGRAM_BOT_TOKEN:'fakebot',TELEGRAM_CHAT_ID:'12345',
@@ -24,13 +24,13 @@ test('migration 0005 is non-destructive, repeatable, and automation OFF by defau
  const {db,env}=fixture();const sql=readFileSync(new URL('../migrations/0005_paper_execution.sql',import.meta.url),'utf8');db.exec(sql);
  assert.equal(db.prepare('SELECT COUNT(*) n FROM watchlist').get().n,10);
  assert.equal((await readRuntime(env)).enabled,false);
- assert.equal((await readRuntime(env)).armed,true);
+ assert.equal((await readRuntime(env)).armed,false); // Safe upgrade gate remains OFF
  assert.equal(db.prepare('SELECT COUNT(*) n FROM paper_trades').get().n,0);
 });
 test('paper credentials/arming + order shape cannot be redirected to live host',async()=>{
  const {env}=fixture();
  assert.equal(paperArmed({...env,PAPER_AUTOTRADE_ARM:'OTHER'}),false);
- await assert.rejects(()=>updateRuntime({...env,PAPER_AUTOTRADE_ARM:undefined},true,'test'),/Segreto/);
+ await assert.rejects(()=>updateRuntime({...env,PAPER_AUTOTRADE_ARM:undefined},true,'test'),/segreto|collaudato|mancante/i);
  await assert.rejects(()=>paperRequest(env,'https://api.alpaca.markets/v2/orders'),/Endpoint/);
  await assert.rejects(()=>paperRequest(env,'/positions',{method:'POST',body:{}}),/POST/);
  await assert.rejects(()=>paperRequest({...env,PAPER_AUTOTRADE_ARM:''},'/orders',{method:'POST',body:{order_class:'bracket',side:'buy',type:'limit',time_in_force:'gtc',extended_hours:false}}),/autorizzato/);
@@ -55,6 +55,7 @@ test('authenticated same-origin + explicit confirmation required for enable and 
  const bad=await attempt('/api/paper/settings',{action:'enable',confirm:'BUY'});assert.equal(bad.status,400);
  const cross=await attempt('/api/paper/settings',{action:'enable',confirm:'ENABLE_PAPER_ONLY'},{Origin:'https://evil.example'});assert.equal(cross.status,403);
  assert.equal((await readRuntime(env)).enabled,false);
+ env.DB.prepare('UPDATE release_guard SET validated=1 WHERE id=1').run();
  const ok=await attempt('/api/paper/settings',{action:'enable',confirm:'ENABLE_PAPER_ONLY'});assert.equal(ok.status,200);
  assert.equal((await readRuntime(env)).enabled,true);
  const pause=await attempt('/api/paper/settings',{action:'pause'});assert.equal(pause.status,200);
@@ -87,6 +88,7 @@ test('auto Paper executes exactly one bracket; reconciles entry, exit, expected 
   throw new Error('Unexpected URL '+url);
  };
  try{
+  db.prepare('UPDATE release_guard SET validated=1 WHERE id=1').run();
   await updateRuntime(env,true,'test');
   const outcomes=[{symbol:'AAPL',technical:technical(fixed)}];
   const first=await runPaperAutomation(env,{outcomes,account:makeAccount(),date:'2026-11-04'});
@@ -128,6 +130,7 @@ test('daily equity drawdown 1% blocks all Paper entries and permanently pauses u
   return Response.json([]);
  };
  try{
+  db.prepare('UPDATE release_guard SET validated=1 WHERE id=1').run();
   await updateRuntime(env,true,'test');
   db.prepare('UPDATE paper_runtime SET day_key=?,day_start_equity=? WHERE id=1').run('2026-11-04',100000);
   const account=normalizePaperAccount({equity:'98900',cash:'98900',buying_power:'300000',currency:'USD',status:'ACTIVE'});

@@ -2,6 +2,8 @@ import { calculateMetrics, partsNY, SCOUT_RULES } from './scout.js';
 import { validPassword, makeSession, validSession, sessionCookie, expiredSessionCookie, isSameOrigin } from './auth.js';
 import { dashboardHtml, loginHtml, appCss, appJs } from './ui.js';
 import { calculateTechnical, TECH_CONFIG } from './technical.js';
+import { MARKET_RULES, shardWatchlist, retrieveMarketBars, pruneMarketCache } from './market-data.js';
+import { saveSignalDiagnostics } from './diagnostics.js';
 import { normalizeNews, buildNewsUrl } from './news.js';
 import { sendTelegram } from './alerts.js';
 import { buildProposal, skepticReview, PROPOSAL_RULES } from './proposals.js';
@@ -45,43 +47,15 @@ async function alpacaFetch(env, url) {
 async function alpacaClock(env) { return alpacaFetch(env, `${PAPER_BASE}/clock`); }
 async function alpacaPaperAccount(env) { return normalizePaperAccount(await alpacaFetch(env, `${PAPER_BASE}/account`)); }
 async function recordPaperSnapshot(env,account) {
-  // Snapshot the entire Alpaca Paper account independently of our trading strategy.
+  // Do not write a fresh account snapshot on every scan/dashboard refresh.
+  const previous=await env.DB.prepare('SELECT snapshot_at FROM paper_account_snapshots ORDER BY snapshot_at DESC LIMIT 1').first();
+  if(previous && Date.now()-Date.parse(previous.snapshot_at)<15*60_000)return false;
   await env.DB.prepare(`INSERT INTO paper_account_snapshots
     (id,snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status,blocked)
     VALUES(?,?,?,?,?,?,?,?,?)`).bind(crypto.randomUUID(),iso(),account.equity,account.cash,
       account.buyingPower,account.cashNoLeverage,account.previousEquity,account.status,
       account.blocked?1:0).run();
-}
-async function alpacaBars(env, symbol) {
-  const url = new URL(`${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars`);
-  url.searchParams.set('timeframe', '15Min');
-  url.searchParams.set('feed', 'iex');
-  url.searchParams.set('adjustment', 'raw');
-  url.searchParams.set('sort', 'asc');
-  url.searchParams.set('limit', '1000');
-  url.searchParams.set('start', new Date(Date.now() - 21 * 86_400_000).toISOString());
-  url.searchParams.set('end', new Date().toISOString());
-  const data = await alpacaFetch(env, url.toString());
-  if (data.next_page_token) throw new Error(`${symbol}: risultati paginati: ridurre periodo o implementare paginazione`);
-  if (!Array.isArray(data.bars)) throw new Error(`${symbol}: risposta bars non valida`);
-  return data.bars;
-}
-
-async function alpaca5mBars(env, symbol) {
-  // Seven calendar days of 5Min bars: normally under the 1,000-row per-symbol limit.
-  // Fail closed on partial pagination, instead of calculating indicators from missing candles.
-  const url = new URL(`${DATA_BASE}/stocks/${encodeURIComponent(symbol)}/bars`);
-  url.searchParams.set('timeframe', '5Min');
-  url.searchParams.set('feed', 'iex');
-  url.searchParams.set('adjustment', 'raw');
-  url.searchParams.set('sort', 'asc');
-  url.searchParams.set('limit', '1000');
-  url.searchParams.set('start', new Date(Date.now() - 7 * 86_400_000).toISOString());
-  url.searchParams.set('end', new Date().toISOString());
-  const data = await alpacaFetch(env, url.toString());
-  if (data.next_page_token) throw new Error(`${symbol}: pagina 5Min incompleta`);
-  if (!Array.isArray(data.bars)) throw new Error(`${symbol}: risposta 5Min non valida`);
-  return data.bars;
+  return true;
 }
 async function saveTechnical(env, symbol, metric) {
   if(!metric?.ok) return;
@@ -94,7 +68,7 @@ async function saveTechnical(env, symbol, metric) {
       high20=excluded.high20,volume_ratio20=excluded.volume_ratio20,
       trend=excluded.trend,breakout=excluded.breakout,
       bull_flag_candidate=excluded.bull_flag_candidate,updated_at=excluded.updated_at
-    WHERE excluded.bar_ts >= technical_snapshots.bar_ts`)
+    WHERE excluded.bar_ts > technical_snapshots.bar_ts`)
     .bind(symbol,metric.barTs,metric.close,metric.volume,metric.rsi14,metric.ema20,
       metric.sma50,metric.high20,metric.volumeRatio20,metric.trend,
       Number(metric.breakout),Number(metric.bullFlagCandidate),iso()).run();
@@ -120,13 +94,20 @@ async function fetchNews(env, symbols) {
   if(!Array.isArray(response.news))throw new Error('Risposta News Alpaca non valida');
   const articles=normalizeNews(response.news,symbols);
   if(articles.length){
-    // Individual writes: safe for D1 free-tier limits and idempotent on repeated scans.
+    // Query recent IDs once: only new articles cause D1 INSERTs.
+    const recent=await env.DB.prepare('SELECT article_id FROM news_items WHERE published_at>=?')
+      .bind(new Date(Date.now()-3*86400000).toISOString()).all();
+    const known=new Set((recent.results||[]).map(x=>String(x.article_id)));
     for(const a of articles){
+      if(known.has(String(a.id)))continue;
       await env.DB.prepare(`INSERT OR IGNORE INTO news_items
        (article_id,headline,source,source_url,published_at,symbols_json,fetched_at)
        VALUES(?,?,?,?,?,?,?)`).bind(a.id,a.headline,a.source,a.url,a.publishedAt,JSON.stringify(a.symbols),iso()).run();
     }
   }
+  await env.DB.prepare(`INSERT INTO source_health(source,last_success_at,last_error) VALUES('alpaca_news',?,NULL)
+    ON CONFLICT(source) DO UPDATE SET last_success_at=excluded.last_success_at,last_error=NULL`)
+    .bind(iso()).run();
   return articles.length;
 }
 
@@ -135,7 +116,7 @@ async function createInformationProposals(env, outcomes, today, budget) {
   const stats={created:0,ignored:0,errors:0};
   if (!budget) return {...stats,reason:"Account Paper non disponibile: nessuna proposta creata"};
   let num=Number((await env.DB.prepare('SELECT COUNT(*) AS n FROM trade_proposals WHERE trade_date=?').bind(today).first())?.n||0);
-  let pending=Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM trade_proposals WHERE status IN ('WAIT','SKIP')").first())?.n||0);
+  let pending=Number((await env.DB.prepare("SELECT COUNT(*) AS n FROM trade_proposals WHERE trade_date=? AND status IN ('WAIT','SKIP')").bind(today).first())?.n||0);
   for(const o of outcomes) {
     if(o.error||!o.technical?.ok||pending>=PROPOSAL_RULES.maxPending||num>=PROPOSAL_RULES.maxPerDay)continue;
     const candidate=buildProposal(o.technical,new Date(),budget);
@@ -189,30 +170,35 @@ async function tryLock(env) {
 async function releaseLock(env, owner) {
   await env.DB.prepare("DELETE FROM scan_lock WHERE name='scout' AND owner=?").bind(owner).run();
 }
-async function saveRecentBars(env, symbol, bars) {
-  const valid = bars.filter(b => Number.isFinite(b.o) && Number.isFinite(b.h) &&
-    Number.isFinite(b.l) && Number.isFinite(b.c) && Number.isFinite(b.v) &&
-    Number.isFinite(Date.parse(b.t)) && b.c > 0 && b.v >= 0).slice(-8);
-  if (!valid.length) return;
-  const stmts = valid.map(b => env.DB.prepare(`INSERT INTO price_bars(symbol,ts,open,high,low,close,volume,feed)
-    VALUES(?,?,?,?,?,?,?,'iex') ON CONFLICT(symbol,ts) DO UPDATE SET
-    open=excluded.open,high=excluded.high,low=excluded.low,close=excluded.close,volume=excluded.volume`)
-    .bind(symbol,b.t,b.o,b.h,b.l,b.c,b.v));
+async function saveRecentBars(env,symbol,bars) {
+  // Keep legacy Watchlist data for UI, but never rewrite the same completed bar.
+  const valid=bars.filter(b=>Number.isFinite(Date.parse(b.t)) && b.c>0 && b.v>=0).slice(-8);
+  if(!valid.length)return;
+  const latest=await env.DB.prepare('SELECT MAX(ts) AS ts FROM price_bars WHERE symbol=?').bind(symbol).first();
+  const fresh=valid.filter(b=>!latest?.ts||b.t>latest.ts);
+  if(!fresh.length)return;
+  const stmts=fresh.map(b=>env.DB.prepare(`INSERT OR IGNORE INTO price_bars(symbol,ts,open,high,low,close,volume,feed)
+    VALUES(?,?,?,?,?,?,?,'iex')`).bind(symbol,b.t,b.o,b.h,b.l,b.c,b.v));
   await env.DB.batch(stmts);
 }
 
-export async function runScan(env, source = 'manual') {
+export async function runScan(env, source = 'manual', options={}) {
   requireConfig(env);
   const owner = await tryLock(env);
   if (!owner) return { status: 'busy', detail: 'Un’altra scansione è già in corso.' };
   const runId = crypto.randomUUID(), started = iso();
   let status = 'running', detail = '', checked = 0, alerts = 0, recorded = false, techEvents = 0, newsCount = 0, proposals = 0, proposalErrors=0;
-  let budget=null,accountNote='',paperAccount=null;
+  let budget=null,accountNote='',paperAccount=null, reconciled=false;
   try {
     await env.DB.prepare(`INSERT INTO scan_runs(id,started_at,status,source) VALUES(?,?,'running',?)`)
       .bind(runId, started, source).run();
     recorded = true;
-    // Re-read Alpaca Paper every scan. Missing account data MUST NEVER lead to using a fake budget.
+    // Confirm market open BEFORE writing account snapshots or fetching history.
+    const clock = await alpacaClock(env);
+    if (!clock.is_open) {
+      status='skipped';detail=`Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}`;
+      return {status,detail,symbols_checked:0,alerts_created:0};
+    }
     try{
       const account=await alpacaPaperAccount(env);
       paperAccount=account;
@@ -223,35 +209,32 @@ export async function runScan(env, source = 'manual') {
       accountNote='Saldo Alpaca Paper non verificabile: proposte bloccate';
       console.error('Paper account sync failed:',String(e?.message||e).slice(0,160));
     }
-    const clock = await alpacaClock(env);
-    if (!clock.is_open) {
-      status = 'skipped';
-      detail = `Borsa USA chiusa. Prossima apertura: ${clock.next_open || 'da verificare'}` + (accountNote?' · '+accountNote:'');
-      return { status, detail, symbols_checked: 0, alerts_created: 0 };
-    }
-    const watchlist = await env.DB.prepare('SELECT symbol FROM watchlist WHERE enabled=1 ORDER BY symbol LIMIT 20').all();
-    const symbols = (watchlist.results || []).map(r => r.symbol);
+    const watchlist = await env.DB.prepare(`SELECT symbol FROM watchlist WHERE enabled=1 ORDER BY symbol LIMIT ?`)
+       .bind(MARKET_RULES.maxWatchlist).all();
+    const allSymbols=(watchlist.results||[]).map(r=>r.symbol);
+    // Cron: 5 stable shards, ~5-minute per-symbol cadence, rather than 50 at once.
+    // Manual: bounded smoke test, cannot submit orders.
+    const symbols=source==='cron' ? shardWatchlist(allSymbols,new Date()) : allSymbols.slice(0,10);
     if (!symbols.length) {
-      status = 'skipped'; detail = 'Watchlist vuota';
+      if(source==='cron'){await runPaperAutomation(env);reconciled=true;}
+      status = 'skipped'; detail = 'Nessun titolo nella tranche; riconciliazione Paper eseguita';
       return { status, detail, symbols_checked: 0, alerts_created: 0 };
     }
-    const cache = new Map();
-    // At most four concurrent ticker jobs; two read-only data fetches per symbol.
-    const outcomes = [];
-    for (let i = 0; i < symbols.length; i += 4) {
-      const chunk = symbols.slice(i, i + 4);
-      const result = await Promise.all(chunk.map(async symbol => {
-        try {
-          const [bars15,bars5]=await Promise.all([alpacaBars(env,symbol),alpaca5mBars(env,symbol)]);
-          const metric = calculateMetrics(bars15, new Date(), cache);
-          const technical = calculateTechnical(bars5, new Date(), cache);
-          await saveRecentBars(env,symbol,bars15);
-          await saveTechnical(env,symbol,technical);
-          return { symbol, metric, technical };
-        } catch (e) { return { symbol, error: String(e.message || e).slice(0, 180) }; }
-      }));
-      outcomes.push(...result);
+    const cache=new Map(), now=new Date();
+    const market=await retrieveMarketBars(env,symbols,{now});
+    const outcomes=[];
+    for(const symbol of symbols){
+      const r=market.get(symbol);
+      if(!r||r.error){outcomes.push({symbol,error:r?.error||'Barre assenti'});continue;}
+      try{
+        const metric=calculateMetrics(r.bars15,now,cache);
+        const technical=calculateTechnical(r.bars5,now,cache);
+        await saveRecentBars(env,symbol,r.bars15);
+        await saveTechnical(env,symbol,technical);
+        outcomes.push({symbol,metric,technical});
+      }catch(e){outcomes.push({symbol,error:String(e.message||e).slice(0,180)});}
     }
+    await saveSignalDiagnostics(env,outcomes,now,budget);
     checked = outcomes.filter(o => !o.error).length;
     const errors = outcomes.filter(o => o.error).map(o => `${o.symbol}: ${o.error}`);
     const today = partsNY(new Date().toISOString(), cache).date;
@@ -285,19 +268,25 @@ export async function runScan(env, source = 'manual') {
     techEvents=newEvents.length;
     const readyTechnical=outcomes.filter(o=>o.technical?.ok).length;
     let newsError='';
-    try{newsCount=await fetchNews(env,symbols);}catch(e){
-      // News source is optional in V1.1; market data can still work.
+    try{if(source==='manual' || new Date().getUTCMinutes()%15===0)
+      newsCount=await fetchNews(env,allSymbols);}catch(e){
       newsError=`News non disponibili: ${String(e?.message||e).slice(0,100)}`;
+      await env.DB.prepare(`INSERT INTO source_health(source,last_error) VALUES('alpaca_news',?)
+        ON CONFLICT(source) DO UPDATE SET last_error=excluded.last_error`).bind(newsError).run();
     }
+    const newsHealth=await env.DB.prepare("SELECT last_success_at,last_error FROM source_health WHERE source='alpaca_news'").first();
+    const newsFresh=Boolean(newsHealth?.last_success_at &&
+      Date.now()-Date.parse(newsHealth.last_success_at)<=20*60_000 && !newsHealth.last_error);
     // No proposals from incomplete/noncurrent data; risk rules apply before Skeptic.
     const pstats=await createInformationProposals(env,outcomes,today,budget);
     proposals=pstats.created;proposalErrors=pstats.errors;
     // Only after deterministic indicators, account and risk checks. Disabled unless explicitly armed.
-    const paperResult=source==='cron' ?
+    const paperResult=source==='cron'&&newsFresh ?
       await runPaperAutomation(env,{outcomes,account:paperAccount,date:today}) :
       await runPaperAutomation(env); // Manual Scout button NEVER places a Paper order.
+    reconciled=true;
     const telegram=await sendTelegram(env,newEvents);
-    const suffix=` · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
+    const suffix=` · tranche ${symbols.length}/${allSymbols.length} titoli · ${readyTechnical}/${symbols.length} indicatori 5m pronti · ${techEvents} eventi tecnici · ${newsCount} notizie · ${proposals} proposte informative` +
       (proposalErrors?` · ${proposalErrors} errori proposte`:``) +
       (telegram.status==='error'?' · Telegram non inviato':'') + (newsError?` · ${newsError}`:'') + (accountNote?` · ${accountNote}`:'');
     status = errors.length ? (checked ? 'partial' : 'error') : 'success';
@@ -308,6 +297,7 @@ export async function runScan(env, source = 'manual') {
     status = 'error'; detail = String(e.message || e).slice(0, 500);
     return { status, detail, symbols_checked: checked, alerts_created: alerts };
   } finally {
+    if(source==='cron'&&!reconciled){try{await runPaperAutomation(env);}catch(e){console.error('Riconciliazione dopo scansione fallita',String(e.message||e).slice(0,120));}}
     try {
       if (recorded) await env.DB.prepare(`UPDATE scan_runs SET finished_at=?,status=?,symbols_checked=?,alerts_created=?,detail=? WHERE id=?`)
         .bind(iso(),status,checked,alerts,detail,runId).run();
@@ -318,7 +308,7 @@ export async function runScan(env, source = 'manual') {
 }
 
 async function overview(env) {
-  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper, paperExecution] = await Promise.all([
+  const [watch, signals, scans, totals, technical, technicalEvents, news, proposals, lastPaper, firstPaper, paperExecution,diagnostics] = await Promise.all([
     env.DB.prepare(`SELECT w.symbol,w.label,w.enabled,b.close AS price,b.volume,b.ts AS bar_ts,
         (SELECT COUNT(*) FROM signals s WHERE s.symbol=w.symbol) AS all_signals
        FROM watchlist w LEFT JOIN price_bars b ON b.symbol=w.symbol AND b.ts=(SELECT MAX(x.ts) FROM price_bars x WHERE x.symbol=w.symbol)
@@ -333,7 +323,8 @@ async function overview(env) {
     env.DB.prepare(`SELECT id,symbol,bar_ts,trade_date,source_event,entry_price,stop_price,target_price,shares,notional,loss_at_stop,reward_risk,rationale,cautions_json,technical_json,skeptic_mode,skeptic_verdict,skeptic_reasons_json,status,created_at,reviewed_at FROM trade_proposals ORDER BY created_at DESC LIMIT 25`).all(),
     env.DB.prepare('SELECT snapshot_at,equity,cash,buying_power,cash_no_leverage,previous_equity,status FROM paper_account_snapshots ORDER BY snapshot_at DESC LIMIT 1').first(),
     env.DB.prepare('SELECT snapshot_at,equity FROM paper_account_snapshots ORDER BY snapshot_at ASC LIMIT 1').first(),
-    paperDashboard(env)
+    paperDashboard(env),
+    env.DB.prepare('SELECT symbol,bar_ts,status,reason,rsi14,volume_ratio,orb_high,orb_confirmed,updated_at FROM scanner_diagnostics ORDER BY symbol LIMIT 50').all()
   ]);
   // Do not silently show stale snapshots as if they were current.
   let account=null,accountError=null;
@@ -370,6 +361,8 @@ async function overview(env) {
     paperExecution,
     positions: paperExecution.summary.active, orders: paperExecution.summary.total,
     virtualBalance: account?.equity??null, // Live read-only Alpaca PAPER equity, no fake fallback.
+    scannerDiagnostics: diagnostics.results||[],
+    scanConfig: {maxWatchlist:MARKET_RULES.maxWatchlist,shards:MARKET_RULES.shards,minutePeriod:5},
     enabledCount: (watch.results || []).filter(x => x.enabled).length
   };
 }
@@ -382,7 +375,7 @@ async function addWatchSymbol(request, env) {
   const label = String(input?.label || '').slice(0, 50);
   const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM watchlist WHERE enabled=1').first();
   const exists = await env.DB.prepare('SELECT enabled FROM watchlist WHERE symbol=?').bind(symbol).first();
-  if (!exists?.enabled && Number(count?.n || 0) >= 20) return err('Massimo 20 titoli attivi', 409);
+  if (!exists?.enabled && Number(count?.n || 0) >= MARKET_RULES.maxWatchlist) return err('Massimo '+MARKET_RULES.maxWatchlist+' titoli attivi',409);
   await env.DB.prepare(`INSERT INTO watchlist(symbol,label,enabled) VALUES(?,?,1)
     ON CONFLICT(symbol) DO UPDATE SET label=CASE WHEN excluded.label!='' THEN excluded.label ELSE watchlist.label END,enabled=1`)
     .bind(symbol,label).run();
@@ -470,8 +463,16 @@ export default {
     return response;
   },
   async scheduled(_event, env, ctx) {
-    // Every 5 minutes: monitor Alpaca fills and send Telegram. Every 15: also scan.
-    const task=new Date().getUTCMinutes()%15===0?runScan(env,'cron'):runPaperAutomation(env);
+    // Every UTC minute, one of five shards. Each symbol is checked ~every 5m.
+    // When closed, only occasional reconciliation/Telegram and daily report.
+    // Existing protective bracket orders are broker-side on Alpaca Paper.
+    const now=new Date(), ny=partsNY(now.toISOString(),new Map());
+    const active=ny.regular&&ny.slot>='09:36'&&ny.slot<'15:55';
+    const reconcileWindow=ny.regular || (ny.weekday!=='Sat'&&ny.weekday!=='Sun'&&ny.slot>='16:00'&&ny.slot<='16:30');
+    const cleanup=ny.weekday==='Mon'&&ny.slot==='09:25';
+    const task=cleanup?pruneMarketCache(env,now).then(()=>runPaperAutomation(env)):
+      active?runScan(env,'cron'):
+      (reconcileWindow||now.getUTCMinutes()%15===0?runPaperAutomation(env):Promise.resolve({status:'IDLE'}));
     ctx.waitUntil(task.catch(e=>console.error('Paper/Scout cron failed',String(e?.message||e).slice(0,240))));
   }
 };

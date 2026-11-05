@@ -7,7 +7,7 @@ export const TECH_CONFIG = Object.freeze({
   rsiPeriod: 14, emaPeriod: 20, smaPeriod: 50,
   breakoutLookback: 20, breakoutVolumeMultiple: 1.4,
   flagImpulsePct: 2.5, flagMaxRetracementPct: 2.0,
-  eventCooldownMinutes: 60, maxEventsPerDay: 6
+  eventCooldownMinutes: 60, maxEventsPerDay: 20
 });
 
 export function ema(values, period) {
@@ -80,7 +80,20 @@ export function calculateTechnical(rawBars, now=new Date(), cache=new Map()) {
     if(impulsePct>=TECH_CONFIG.flagImpulsePct && depth<=TECH_CONFIG.flagMaxRetracementPct &&
         declining && reclaim && strongVolume && uptrend)bullFlagCandidate=true;
   }
+  // Adapted concept from trader-entry ORB: first completed close strictly above
+  // the high of 09:30/09:35/09:40 ET bars. INFORMATIONAL ONLY in 1.3.1.
+  const todayBars=valid.filter(b=>partsNY(b.t,cache).date===currentDay);
+  const openBars=['09:30','09:35','09:40'].map(slot=>todayBars.find(b=>partsNY(b.t,cache).slot===slot));
+  let orb15=null;
+  if(openBars.every(Boolean)){
+    const rangeHigh=Math.max(...openBars.map(b=>b.h));
+    const rangeLow=Math.min(...openBars.map(b=>b.l));
+    const trigger=todayBars.find(b=>partsNY(b.t,cache).slot>='09:45'&&b.c>rangeHigh);
+    orb15={rangeHigh:round(rangeHigh,4),rangeLow:round(rangeLow,4),confirmed:Boolean(trigger),
+      justConfirmed:Boolean(trigger&&trigger.t===latest.t),triggeredAt:trigger?.t||null};
+  }
   const events=[];
+  if(orb15?.justConfirmed)events.push({kind:'ORB15_CONFIRM',description:'Prima candela 5m chiusa sopra il massimo del range iniziale di 15 minuti (solo informativo)'});
   if(breakout)events.push({kind:'BREAKOUT_20',description:'Chiusura oltre massimo delle 20 barre precedenti con volume relativo elevato'});
   if(bullFlagCandidate)events.push({kind:'BULL_FLAG_CANDIDATE',description:'Possibile consolidamento dopo un impulso rialzista (euristica da verificare)'});
   if(r14>=70)events.push({kind:'RSI_HIGH',description:'RSI14 elevato: può indicare forza o ipercomprato, non necessariamente inversione'});
@@ -90,7 +103,7 @@ export function calculateTechnical(rawBars, now=new Date(), cache=new Map()) {
     rsi14:round(r14),ema20:round(e20,4),sma50:round(s50,4),
     high20:round(high20,4),volumeRatio20:round(volRatio),
     trend:uptrend?'UP':latest.c<s50?'DOWN':'NEUTRAL',
-    breakout,bullFlagCandidate,events,ageMinutes:round(ageMin,1),
+    breakout,bullFlagCandidate,orb15,events,ageMinutes:round(ageMin,1),
     source:'Alpaca IEX, 5Min, sessione regolare'
   };
 }

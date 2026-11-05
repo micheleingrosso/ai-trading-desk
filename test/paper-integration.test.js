@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync} from 'node:fs';
 import worker,{runScan} from '../src/index.js';
-const migrationNames=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'];
+const migrationNames=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql','0006_scaling_diagnostics.sql'];
 function fixture(){
   const raw=new DatabaseSync(':memory:');
   for(const filename of migrationNames)raw.exec(readFileSync(new URL('../migrations/'+filename,import.meta.url),'utf8'));
@@ -22,7 +22,7 @@ test('paper account snapshots are additive and migration repeatable',()=>{
  assert.equal(raw.prepare('SELECT COUNT(*) n FROM watchlist').get().n,10);
  assert.equal(raw.prepare("SELECT COUNT(*) n FROM sqlite_master WHERE name='paper_account_snapshots'").get().n,1);
 });
-test('reads current 100k paper account and saves snapshot even if market closed; never orders',async()=>{
+test('reads current 100k paper account without unnecessary closed-market snapshot; never orders',async()=>{
  const {raw,env}=fixture(),prev=globalThis.fetch,urls=[];
  globalThis.fetch=async input=>{
   const u=String(input);urls.push(u);
@@ -32,7 +32,7 @@ test('reads current 100k paper account and saves snapshot even if market closed;
  };
  try{
   const result=await runScan(env,'manual');assert.equal(result.status,'skipped');
-  assert.equal(raw.prepare('SELECT COUNT(*) n FROM paper_account_snapshots').get().n,1);
+  assert.equal(raw.prepare('SELECT COUNT(*) n FROM paper_account_snapshots').get().n,0);
   const cookie=await session(env);
   const res=await worker.fetch(new Request('https://paper-test.example.workers.dev/api/overview',{headers:{Cookie:cookie}}),env);
   assert.equal(res.status,200);const body=await res.json();
@@ -42,7 +42,7 @@ test('reads current 100k paper account and saves snapshot even if market closed;
   assert.equal(body.paperSizing.maxNotional,5000);
   assert.equal(body.paperSizing.maxRisk,250);
   assert.equal(body.virtualBalance,100000);
-  assert.equal(body.paperBalanceChange,0);
+  assert.equal(body.paperBalanceChange,null);
   assert.ok(urls.every(u=>u.startsWith('https://paper-api.alpaca.markets/v2/')));
   assert.ok(urls.every(u=>!u.includes('/orders')&&!u.includes('api.alpaca.markets/v2/orders')));
  } finally{globalThis.fetch=prev;}

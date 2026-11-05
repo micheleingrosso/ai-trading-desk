@@ -1,64 +1,65 @@
-# AI Trading Desk 1.3 — AUTO PAPER, Telegram e risultato delle operazioni
+# AI Trading Desk 1.3.1 — Scalabilità, diagnostica e ORB informativo
 
-**Progetto per uso personale e didattico.** Questa release introduce un esecutore di ordini esclusivamente sul conto **Alpaca Paper Trading**. Non contiene alcun collegamento a un endpoint di trading reale.
+Progetto didattico e personale di osservazione e **trading automatizzato esclusivamente su Alpaca Paper Trading**. Il Worker **non contiene endpoint di esecuzione su Alpaca Live**. Questo codice NON è stato pubblicato sull'account dell'utente. 
 
-> **Stato dopo l'installazione:** AUTO PAPER **DISABILITATO**. Nessun ordine parte automaticamente fino a quando (1) viene configurato il segreto dedicato `PAPER_AUTOTRADE_ARM=PAPER_ONLY` e (2) l'utente abilita manualmente l'automazione dalla dashboard, dopo aver verificato Telegram e Workers AI.
+## Le novità
 
-## Novità della 1.3
+1. **Scansione scaglionata** in 5 tranche (cron ogni 1 minuto), massimo 50 titoli nella watchlist. Ogni simbolo viene analizzato indicativamente una volta ogni 5 minuti; la scansione manuale controlla al massimo i primi 10 titoli ed è sempre senza ordini.
+2. **Alpaca multi-symbol batches** per le barre 5m e 15m, limite 4 simboli per richiesta, gestione esplicita di `next_page_token` e fail-closed su paginazione incompleta o risposta API inattesa.
+3. **Cache D1 incrementale**: storico iniziale per massimo 4 titoli alla volta, poi si salvano principalmente candele nuove e completate; cooldown 30 minuti per bootstrap incompleto. Gli ordini non partono su titoli senza storico affidabile.
+4. **Controlli più frequenti**: nuove opportunità ogni 5 minuti circa; riconciliazione esecuzioni/notifiche ogni minuto durante il mercato, più sporadica durante la notte. L'ora di New York è gestita con `America/New_York`.
+5. **Notizie ogni 15 minuti**, con stato di freschezza: se Alpaca News è indisponibile o l'ultimo controllo riuscito è troppo vecchio (oltre 20 minuti), nuovi ingressi automatici bloccati. Notifiche e posizioni già aperte continuano a essere monitorate.
+6. **Diagnostica per ticker** con motivo del filtro (`NO_PATTERN`, `FILTERED`, `NOT_READY`, `DATA_ERROR`, `SETUP_READY`) e indicatori RSI/volume; durata scansione nello storico. `SETUP_READY` non equivale a un ordine autorizzato: servono ancora notizie, Skeptic, broker e regole di rischio.
+7. **ORB 15 minuti**: concetto adattato dal metodo `trader-entry` di [Jakeschincariol/day-trader-skill](https://github.com/Jakeschincariol/day-trader-skill). Segnale sulla *prima candela completata* sopra l'opening range 9:30–9:45 ET. **Solo informativo**, non è inserito fra i trigger che aprono posizioni.
+8. **Capacità informativa adeguata alla watchlist**: fino a 15 eventi Scout/die, 20 eventi tecnici/die e 10 schede teoriche/die; i limiti di ordini Paper restano invariati (3 nuovi al giorno). Il conteggio delle schede pendenti è limitato alla giornata corrente, non allo storico intero.
+9. **Controlli conservativi**: niente ingressi nei primi 15 minuti di seduta, gate per nuova release e forced pause dopo migrazione. Limiti finanziari Paper esistenti invariati.
+10. **Manutenzione settimanale** della sola cache di mercato (5m oltre 21 giorni e 15m oltre 60); trade, fill, contabilità e audit non vengono cancellati.
 
-- **Bracket orders PAPER**: acquisto con ordine limit, stop-loss condizionato e take-profit, tutti sul dominio fisso `https://paper-api.alpaca.markets/v2`.
-- **Protezione dal retry**: ogni richiesta ha un `client_order_id` univoco e viene prenotata in D1 prima di qualsiasi POST. Se Alpaca non risponde o la risposta è ambigua, l'esecutore si ferma e riconcilia tramite il client ID, senza reinviare automaticamente.
-- **Verifiche prima degli ingressi:** account attivo, orario borsa, dati tecnici recenti, approvazione `PASS` di Skeptic AI, limiti matematici, liquidità senza leva, esclusione di posizioni esterne non riconosciute.
-- **Limiti:** massimo 5% dell'equity per singola posizione, perdita teorica 0,25% dell'equity al prezzo limite, massimo 3 posizioni o ingressi aperti, massimo 3 ordini nuovi al giorno, stop nuovi ingressi a -1% di equity dal primo snapshot del giorno. Nessun nuovo ingresso negli ultimi 30 minuti di seduta.
-- **Notifiche Telegram:** ordine inviato, ingresso realmente eseguito, uscita realmente eseguita, eventi di sicurezza, stato on/off, rapporto giornaliero. Riportano prezzi reali dei fill PAPER, profitto/perdita lordi e confronto con l'obiettivo previsto. Un messaggio può arrivare fino a 5 minuti dopo il fill (o più se cron/API falliscono).
-- **Dashboard:** stato automazione, pulsanti Abilita/Pausa, invio messaggio di prova, riconciliazione manuale, ordini, fill, P/L realizzato e registro consegna Telegram.
-- **Cron 5 minuti:** ogni 15 minuti Scout può generare nuove opportunità; ogni 5 minuti il modulo di esecuzione sincronizza gli ordini PAPER e le notifiche.
-- **Pulsante «Esegui scansione»:** esegue solo monitoraggio e riconciliazione; **non invia ordini**, anche quando AUTO PAPER è abilitato. I nuovi ordini possono essere generati solo dal cron in modalità automatica.
+## Skill del repository GitHub
 
-## Installazione con editor Cloudflare (come la 1.2.1)
+Non abbiamo importato indiscriminatamente gli undici pacchetti Python di Claude. Abbiamo usato **il concetto di Opening Range Breakout di `trader-entry`** con una implementazione JS propria, esclusivamente informativa. Il progetto preserva e ottimizza le sue funzioni già esistenti corrispondenti a `trader-scanner`, `trader-news`, `trader-budget`, `trader-risk`, `trader-broker` e `trader-alerts`. Restano da valutare separatamente `trader-timemachine`, `trader-analyst` e `trader-pelosi`; non sono implementati nella 1.3.1.
 
-Leggere **AGGIORNAMENTO_1.3.md**. In sintesi:
+## Sicurezza e limiti
 
-1. Salva una copia della versione 1.2.1 del Worker e fai un backup D1.
-2. Applica **solo** `migrations/0005_paper_execution.sql` alla console D1 del database esistente `trading-desk-db`. Non ripetere le migrazioni precedenti, già applicate.
-3. Incolla **tutto** `worker-single-file.js` nell'editor del Worker esistente `ai-trading-desk` e fai Deploy. Non ricreare il Worker né il database.
-4. In Workers > **Bindings** conserva `DB` e aggiungi, se non c'è, **Workers AI** con nome `AI` (necessario per l'automazione; senza AI resterà bloccata).
-5. In **Settings > Variables and Secrets** conserva le quattro credenziali esistenti e configura i Telegram `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`. Non inviarli in chat o a terzi.
-6. Configura **Cron Trigger** `*/5 * * * 1-5` (UTC). Rimuovi eventualmente il vecchio `*/15 * * * 1-5` per evitare sovrapposizioni. Questo passaggio è necessario anche se hai aggiornato il codice tramite editor web.
-7. Apri la dashboard, verifica che `AUTO PAPER` sia *in pausa*, premi `Test Telegram`, e poi `Aggiorna esecuzioni`. Conferma che la watchlist e il conto PAPER continuino a funzionare.
-8. Solo quando tutto è verificato, aggiungi un **nuovo secret** Cloudflare `PAPER_AUTOTRADE_ARM` con valore esatto `PAPER_ONLY`, poi torna alla dashboard, digita `PAPER` nel prompt ed abilita AUTO PAPER.
+- Paper only. Nessuna chiave live, leva volontaria o short-selling.
+- Ordini bracket GTC ancora gestiti dal broker Paper. Se il Worker ha un problema, gli stop presenti presso Alpaca non vengono cancellati dal deploy, ma stop e target **non garantiscono** un prezzo di esecuzione.
+- Nessuna pretesa di profitti: rischio statistico non validato. Un test Paper non dimostra efficacia reale.
+- 50 simboli è un **limite software, non una promessa di performance**. Su Workers Free il limite CPU è restrittivo; raccomandiamo osservare Metrics e considerare Workers Paid prima di aumentare oltre 10–20 simboli.
+- La raccolta IEX può essere incompleta; nessuna decisione su dati stantii.
+- Il codice non impone ancora liquidazione forzata a fine sessione, quindi posizioni Paper potrebbero restare aperte overnight.
 
-**IMPORTANTE:** i segreti Alpaca devono essere quelli **Paper Trading**. Nessun account Live è supportato. La gestione del conto Live richiederebbe un progetto, audit e abilitazione separati non inclusi.
+## Installazione
 
-## Funzionamento in pratica
+Leggi prima **AGGIORNAMENTO_1.3.1.md**. Ordine obbligatorio:
 
-| Momento | Operazione |
-|---|---|
-| Ogni 15 minuti, mercato aperto | Analisi delle barre IEX, News, pattern e Skeptic; se tutte le regole passano e AUTO PAPER è attivo, al massimo un nuovo bracket Paper per scansione |
-| Ogni 5 minuti nei giorni feriali | Legge lo stato dei nostri ordini da Alpaca e invia Telegram sui fill confermati |
-| Dopo la chiusura USA | Invia un breve riepilogo quotidiano, con l'eventuale P/L lordo delle operazioni aperte oggi e già chiuse |
-| Errori/risposte ambigue | Disabilita nuovi ingressi, notifica l'evento e lascia intatti gli ordini protettivi già presenti su Alpaca |
+1. Metti in pausa Auto Paper.
+2. Backup del Worker esistente e D1.
+3. Applica migrazione `migrations/0006_scaling_diagnostics.sql`.
+4. Sostituisci il codice con `worker-single-file.js` nell'editor Worker, oppure esegui un deploy Wrangler mantenendo configurazione e database ID reali.
+5. Imposta esattamente **un** Cron Trigger: `* * * * 1-5`.
+6. Collauda la dashboard, le notizie, lo scanner, Telegram, gli ordini esistenti e il monitoraggio.
+7. **Solo dopo il collaudo:** valida manualmente la release in D1 e riabilita l'automazione dalla dashboard.
 
-## Avvertenze e limitazioni da conoscere
+## Struttura file
 
-- **Non è una strategia con redditività dimostrata.** Le metriche di RSI, breakout e bull flag sono filtri euristici; Skeptic AI può sbagliare. I 46 test locali usano **API e mercato simulati** e non sostituiscono test reali del Worker o una validazione statistica.
-- **IEX è un feed parziale**. Prezzi/volumi non descrivono tutto il mercato USA e non forniscono di per sé una quotazione eseguibile. L'ordine limite riduce, ma non annulla, il rischio di variazioni prezzo o fill mancati.
-- **Ordini GTC**: lo stop e il take-profit restano sul broker Paper anche se il Worker smette di funzionare; posizioni aperte possono **restare aperte overnight**, quindi questa release **non implementa una chiusura obbligatoria a fine giornata**. Un ingresso limite non eseguito viene cancellato dopo circa 20 minuti, se Alpaca risponde.
-- **Ingressi parziali:** il bracket può non essere ancora pienamente protetto. Il sistema rileva il fill parziale, blocca nuovi ingressi e richiede verifica sul conto Alpaca. Non tentare di risolvere manualmente dall'app senza controllare prima l'ordine.
-- **Modifiche manuali al conto**: se apri, chiudi o modifichi ordini/posizioni direttamente su Alpaca, potrebbero esserci discrepanze con il database; il motore sospende nuove operazioni. Per la valutazione dell'efficacia è preferibile un conto Paper dedicato al bot.
-- **Telegram non garantisce esattamente una consegna:** il sistema usa un outbox ritentabile, ma una risposta persa dopo il recapito può produrre un messaggio duplicato. Non usare le notifiche come unica fonte di verità.
-- **P/L lordo Paper**: il sistema ricava il valore dai fill comunicati da Alpaca; non equivale a rendimento live netto, e non include tutti i possibili costi o effetti di mercato. La variazione dell'equity del conto include eventuali interventi esterni.
-- **Il P/L giornaliero** del riepilogo riguarda le operazioni aperte nel giorno indicato e già chiuse. Il P/L cumulato e quello relativo a posizioni rimaste aperte sono visualizzati separatamente.
-- **Risorse:** 20 simboli richiedono molti fetch e calcoli. Cloudflare Workers Paid potrebbe essere necessario (CPU, subrequests), così come una quota Workers AI adatta. Senza cron, il bot **non** è autonomo.
-- **Aggiornamenti futuri:** metti in pausa AUTO PAPER prima di sostituire il Worker. Il flag di abilitazione è **persistente nel database** e non viene azzerato automaticamente a ogni nuovo deploy.
+- `src/market-data.js`: API storiche aggregate, cache, paginazione, tranche.
+- `src/diagnostics.js`: spiegazione dei filtri.
+- `src/technical.js`: RSI, EMA, SMA, breakout, bull flag e ORB15 informativo.
+- `src/paper-executor.js`: motore precedente Paper, con gate aggiornamento e limitazioni prudenziali.
+- `src/index.js`: Worker, cron, sincronizzazione, web API e dashboard.
+- `src/ui.js`: dashboard e nuovo pannello diagnostico.
+- `migrations/0006_scaling_diagnostics.sql`: migrazione additiva, pausa forzata.
+- `worker-single-file.js`: codice completo, autogenerato, pronto per editor Cloudflare.
+- `test/`: test locali Node.js con API simulate e database in-memory.
 
-## Sviluppo locale
+## Test locale
 
-- Node.js 22+.
-- `npm install`
-- `npm test`
-- `npm run check`
-- `npm run build:single` (ricostruisce il Worker singolo dopo modifiche).
-- Per deploy via Wrangler, usare il tuo `wrangler.jsonc` esistente e mantenere il **vero** `database_id` del binding D1; quello nel pacchetto è un segnaposto e **non deve** sostituire la configurazione live del tuo Worker.
+Richiede Node.js 22+.
 
-Tabelle introdotte: `paper_runtime`, `paper_execution_lock`, `paper_trades`, `paper_trade_events`. Migrazione non distruttiva 0005. Licenza del repository day-trader-skill non implica che il codice di questo progetto sia stato copiato integralmente: gli algoritmi sono implementati in JavaScript in modo autonomo.
+```bash
+npm test
+npm run check
+npm run build:single
+```
+
+I test non effettuano ordini reali o su account di terzi. Le simulazioni broker non sostituiscono una prova su Alpaca Paper e la misurazione di CPU/latency in Cloudflare.

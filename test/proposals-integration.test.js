@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
 import {readFileSync} from 'node:fs';
 import worker,{runScan} from '../src/index.js';
-const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql'];
+const migrations=['0001_init.sql','0002_technical_news.sql','0003_proposals.sql','0004_paper_snapshots.sql','0005_paper_execution.sql','0006_scaling_diagnostics.sql'];
 function createDB(){
  const raw=new DatabaseSync(':memory:');
  for(const m of migrations)raw.exec(readFileSync(new URL('../migrations/'+m,import.meta.url),'utf8'));
@@ -65,17 +65,19 @@ test('market-open scanner creates a single fresh information proposal, never an 
    bars5.push({t,o:close,h:close+0.05,l:close-0.05,c:close,v:300});
   }
  }
+ const bars15=[];for(const day of ['2026-07-13','2026-07-14','2026-07-15','2026-07-16','2026-07-17','2026-07-20'])for(let i=0;i<(day.endsWith('20')?7:26);i++){const t=new RealDate(RealDate.parse(day+'T13:30:00Z')+i*900000).toISOString();bars15.push({t,o:100,h:100,l:100,c:100,v:300});}
  // Last completed candle: bullish breakout, RSI ~61, relative volume 10x.
  globalThis.fetch=async(input)=>{
   const u=String(input);urls.push(u);
   if(u.endsWith('/clock'))return Response.json({is_open:true});
   if(u.endsWith('/account'))return Response.json({equity:'100000',cash:'100000',buying_power:'200000',status:'ACTIVE',currency:'USD'});
   if(u.includes('/v1beta1/news'))return Response.json({news:[]});
-  if(u.includes('timeframe=5Min')){const data=bars5.map(x=>({...x}));if(u.includes('/AAPL/')){const b=data.at(-1);b.c+=1;b.o=b.c-0.1;b.h=b.c+0.07;b.l=b.c-0.2;b.v=3000;}return Response.json({bars:data});}
-  return Response.json({bars:[]});
+  const all=new URL(u).searchParams.get('symbols')?.split(',')||[],bars={};
+  for(const sym of all){if(u.includes('timeframe=5Min')){const data=bars5.map(x=>({...x}));if(sym==='AAPL'){const b=data.at(-1);b.c+=1;b.o=b.c-0.1;b.h=b.c+0.07;b.l=b.c-0.2;b.v=3000;}bars[sym]=data;}else bars[sym]=bars15;}
+  return Response.json({bars,next_page_token:null});
  };
  try{
-  const out=await runScan(env,'manual');assert.equal(out.status,'success');
+  const out=await runScan(env,'manual');assert.equal(out.status,'partial');
   const count=raw.prepare('SELECT COUNT(*) n FROM trade_proposals').get().n;
   assert.equal(count,1);
   const record=raw.prepare('SELECT * FROM trade_proposals').get();
@@ -84,7 +86,7 @@ test('market-open scanner creates a single fresh information proposal, never an 
   assert.equal(record.status,'WAIT');
   assert.ok(record.notional<=5000&&record.loss_at_stop<=250);
   assert.ok(urls.every(url=>!url.includes('/orders')&&!url.includes('api.alpaca.markets/v2/orders')));
-  const repeat=await runScan(env,'manual');assert.equal(repeat.status,'success');
+  const repeat=await runScan(env,'manual');assert.equal(repeat.status,'partial');
   assert.equal(raw.prepare('SELECT COUNT(*) n FROM trade_proposals').get().n,count);
  }finally{globalThis.fetch=oldFetch;globalThis.Date=RealDate;}
 });
